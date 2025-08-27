@@ -15,6 +15,13 @@ A comprehensive, multi-purpose Discord bot built with `discord.py`. It features 
 - **Democratic Controls**: A vote-based system for skipping, stopping, and other actions ensures fair use.
 - **Advanced Features**: Supports song/queue looping, volume control, and automatic disconnection when idle.
 
+Here's a look at the interactive music player and queue:
+
+![Music Player Now Playing](./assets/now-playing.png)
+
+![Music Queue](./assets/queue.png)
+
+
 ### ✅ Task Management
 - **Server-Specific Tasks**: Each Discord server has its own independent task board.
 - **Assign & Track**: Assign tasks with due dates to specific members.
@@ -22,7 +29,15 @@ A comprehensive, multi-purpose Discord bot built with `discord.py`. It features 
 - **Automatic Reminders**: The bot automatically sends a DM to users one day before their task is due.
 - **Admin Commands**: Server managers can view all tasks on the board.
 
+See how easy it is to manage tasks:
 
+![Add Task](./assets/add-task.png)
+
+![Show Tasks](./assets/show-tasks.png)
+
+![Mark Task Done](./assets/task-done.png)
+
+![Remove Task](./assets/remove-task.png)
 
 ## 🛠️ Setup & Installation
 
