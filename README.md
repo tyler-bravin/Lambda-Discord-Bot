@@ -36,7 +36,7 @@ Follow these steps to get your own instance of the bot running.
 ### 2. Clone the Repository
 Clone this repository to your local machine.
 ```bash
-git clone https://github.com/your-username/lambda-bot.git
+git clone https://github.com/tyler-bravin/lambda-bot.git
 cd lambda-bot
 ```
 
