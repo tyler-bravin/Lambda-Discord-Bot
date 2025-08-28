@@ -2,7 +2,7 @@
 
 ![Discord.py](https://img.shields.io/badge/discord.py-v2.3.2-7289DA?style=for-the-badge&logo=discord&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![MIT License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](https://github.com/tyler-bravin/Lambda-Discord-Bot/blob/main/LICENSE)
 
 A comprehensive, multi-purpose Discord bot built with `discord.py`. It features a feature-rich, persistent music player and a server-specific task management system.
 
