@@ -107,7 +107,7 @@ python main.py
 
 ## 🐳 Deploying with Docker / Coolify
 
-The repository ships with a `Dockerfile` and `docker-compose.yml`, so it can be deployed on any Docker host or on [Coolify](https://coolify.io/).
+The repository ships with a `Dockerfile` and `docker-compose.yaml`, so it can be deployed on any Docker host or on [Coolify](https://coolify.io/).
 
 ### Coolify
 1. Create a new resource from this Git repository and pick the **Docker Compose** build pack (or **Dockerfile** if you prefer — then add a persistent volume mapped to `/data` yourself).
@@ -135,7 +135,7 @@ docker compose up -d --build
 YouTube frequently changes its player in ways that break older yt-dlp releases, so the bot:
 - upgrades yt-dlp to the latest release **every time the container starts** (`entrypoint.sh`),
 - checks for a new release **every 6 hours while running**; if one is installed, the bot restarts itself the next time no server is playing music, and the container's restart policy brings it straight back on the new version,
-- runs the **bgutil PO token provider** sidecar (see `docker-compose.yml`), which answers YouTube's "confirm you're not a bot" attestation checks — the main reason server-hosted bots suddenly stop playing, and
+- runs the **bgutil PO token provider** sidecar (see `docker-compose.yaml`), which answers YouTube's "confirm you're not a bot" attestation checks — the main reason server-hosted bots suddenly stop playing, and
 - **writes rotated cookies back** to `cookies.txt` after every request, so an exported cookie file stays valid indefinitely instead of needing to be re-exported by hand.
 
 A Docker `HEALTHCHECK` also reports the container unhealthy if the bot loses its Discord connection for more than ~90 seconds.
