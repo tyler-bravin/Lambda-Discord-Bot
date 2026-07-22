@@ -1,0 +1,40 @@
+services:
+  lambda-bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - bgutil-provider
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - SPOTIPY_CLIENT_ID=${SPOTIPY_CLIENT_ID}
+      - SPOTIPY_CLIENT_SECRET=${SPOTIPY_CLIENT_SECRET}
+      # Set to 0 to disable automatic yt-dlp upgrades (on start and every 6 hours).
+      - YTDLP_AUTO_UPDATE=${YTDLP_AUTO_UPDATE:-1}
+      # PO token provider sidecar; answers YouTube's bot-detection checks so
+      # playback keeps working headlessly without cookies.
+      - POT_PROVIDER_URL=http://bgutil-provider:4416
+      # Optional TaskBoard web dashboard (off unless WEB_ENABLED=1). See .env.example.
+      - WEB_ENABLED=${WEB_ENABLED:-0}
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID:-}
+      - DISCORD_CLIENT_SECRET=${DISCORD_CLIENT_SECRET:-}
+      - WEB_REDIRECT_URI=${WEB_REDIRECT_URI:-}
+      - WEB_PORT=${WEB_PORT:-8080}
+      - WEB_SECURE=${WEB_SECURE:-0}
+      - WEB_SECRET_KEY=${WEB_SECRET_KEY:-}
+      # Playback controls on the now-playing screen (require Discord login + in-channel).
+      - WEB_CONTROLS=${WEB_CONTROLS:-0}
+      - WEB_BASE_URL=${WEB_BASE_URL:-}
+    volumes:
+      # Persists music_queue.db, tasks.json and cookies.txt across redeploys.
+      - lambda-data:/data
+    # Exposes the web dashboard. Harmless when the dashboard is disabled.
+    ports:
+      - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
+
+  # Generates YouTube PO tokens for yt-dlp (bgutil-ytdlp-pot-provider plugin).
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+
+volumes:
+  lambda-data:
