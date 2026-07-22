@@ -46,4 +46,8 @@ def mock_context(mock_bot):  # <-- 1. ADD mock_bot as a dependency
     ctx.author = MagicMock(spec=discord.Member)
     ctx.author.id = 2000
     ctx.send = AsyncMock()
+    ctx.defer = AsyncMock()
+    # None marks a classic (prefix) invocation so hybrid command checks use the
+    # non-interaction path.
+    ctx.interaction = None
     return ctx

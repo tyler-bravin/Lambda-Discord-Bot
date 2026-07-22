@@ -24,7 +24,11 @@ import yt_dlp
 import asyncio
 import aiosqlite
 import json
+import logging
 import math
+import subprocess
+import sys
+import threading
 import traceback
 import random
 import time
@@ -36,14 +40,34 @@ from collections import deque
 from typing import Union
 import urllib.parse
 
+log = logging.getLogger(__name__)
+
 # --- Bot Setup: yt-dlp and FFmpeg Configuration ---
+
+# Directory for persistent data (database, cookies, cache). On Docker/Coolify this
+# is set to a mounted volume (e.g. /data) so state survives redeploys.
+DATA_DIR = os.getenv("DATA_DIR", ".")
 
 # Suppress yt-dlp's default bug report message on console errors.
 yt_dlp.utils.bug_reports_message = lambda **kwargs: ''
 
+
+def _find_cookie_file() -> Union[str, None]:
+    """Returns the first existing cookies file, or None if there isn't one."""
+    candidates = [
+        os.getenv("YTDLP_COOKIES"),
+        os.path.join(DATA_DIR, "cookies.txt"),
+        "cookies.txt",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
 # Configuration for yt-dlp to optimize for audio-only streams.
 ytdl_format_options = {
-    'cachedir': '.cache',
+    'cachedir': os.path.join(DATA_DIR, '.yt-dlp-cache'),
     # Prioritizes best audio quality, preferring opus format and streams over 128kbps.
     'format': 'bestaudio[ext=opus]/bestaudio[abr>128]/bestaudio/best',
     'extractaudio': True,
@@ -60,8 +84,102 @@ ytdl_format_options = {
     'default_search': 'auto',
     # Binds to '0.0.0.0' to mitigate potential IP-related blocking from services like YouTube.
     'source_address': '0.0.0.0',
-    'cookiefile': 'cookies.txt',
+    # Retry transient network/extraction failures instead of failing the request.
+    'retries': 3,
+    'fragment_retries': 10,
+    'extractor_retries': 3,
+    'socket_timeout': 15,
 }
+
+_cookie_file = _find_cookie_file()
+if _cookie_file:
+    ytdl_format_options['cookiefile'] = _cookie_file
+    log.info("Using YouTube cookies from %s", _cookie_file)
+
+# Alternative to a cookies file for non-Docker setups: read cookies straight from
+# a browser profile on the same machine, e.g. "chrome" or "firefox:ProfileName".
+# Inside a container there is no browser, so use the cookies file there instead.
+_cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
+if _cookies_from_browser:
+    browser, _, profile = _cookies_from_browser.partition(':')
+    ytdl_format_options['cookiesfrombrowser'] = (browser, profile or None, None, None)
+    log.info("Reading YouTube cookies from browser: %s", _cookies_from_browser)
+
+# Optional PO token provider (bgutil-ytdlp-pot-provider sidecar). This is what
+# lets YouTube playback keep working headlessly without any cookies for normal
+# videos — it answers YouTube's "confirm you're not a bot" attestation checks.
+_pot_provider_url = os.getenv("POT_PROVIDER_URL")
+if _pot_provider_url:
+    ytdl_format_options['extractor_args'] = {
+        'youtubepot-bgutilhttp': {'base_url': [_pot_provider_url]},
+    }
+    log.info("Using PO token provider at %s", _pot_provider_url)
+
+
+def create_ytdl() -> yt_dlp.YoutubeDL:
+    """Creates a fresh YoutubeDL instance."""
+    return yt_dlp.YoutubeDL(ytdl_format_options)
+
+
+# All extractions go through one shared YoutubeDL instance behind a lock. This
+# serializes yt-dlp (whose instances are not thread-safe) and, crucially, keeps a
+# single cookie jar alive: YouTube *rotates* cookies during use, and saving the
+# jar after every extraction writes the rotated values back to cookies.txt so the
+# file never goes stale and never needs to be re-exported by hand.
+_ytdl_lock = threading.Lock()
+_shared_ytdl: Union[yt_dlp.YoutubeDL, None] = None
+
+
+def extract_info_blocking(query: str, download: bool = False) -> dict:
+    """Thread-safe yt-dlp extraction. Blocking — run in an executor."""
+    global _shared_ytdl
+    with _ytdl_lock:
+        if _shared_ytdl is None:
+            _shared_ytdl = create_ytdl()
+        data = _shared_ytdl.extract_info(query, download=download)
+        _save_cookies(_shared_ytdl)
+        return data
+
+
+def _save_cookies(ydl: yt_dlp.YoutubeDL):
+    """Persists rotated YouTube cookies back to the cookie file, if one is in use."""
+    try:
+        jar = ydl.cookiejar
+        if getattr(jar, 'filename', None):
+            jar.save()
+    except Exception as e:
+        log.debug("Could not save rotated cookies: %s", e)
+
+
+def extract_flat_playlist_blocking(url: str) -> list:
+    """
+    Flat-extracts a playlist's entries (titles + URLs only, no per-video network
+    calls). Blocking — run in an executor. Returns a list of entry dicts.
+    """
+    opts = dict(ytdl_format_options)
+    opts['noplaylist'] = False
+    # 'in_playlist' returns lightweight entries without resolving each video.
+    opts['extract_flat'] = 'in_playlist'
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        data = ydl.extract_info(url, download=False)
+    return data.get('entries') or []
+
+
+def _upgrade_ytdlp_blocking() -> bool:
+    """
+    Upgrades yt-dlp via pip. Blocking — run in an executor.
+
+    Returns True if a new version was actually installed (as opposed to
+    already being up to date or the upgrade failing).
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir", "yt-dlp"],
+        capture_output=True, text=True, timeout=600,
+    )
+    if result.returncode != 0:
+        log.warning("yt-dlp upgrade failed: %s", result.stderr.strip()[-500:])
+        return False
+    return "Successfully installed" in result.stdout
 
 # Configuration for FFmpeg, the audio processing library.
 ffmpeg_options = {
@@ -71,11 +189,23 @@ ffmpeg_options = {
     'options': '-vn'
 }
 
-# Initialize the YoutubeDL client with the specified options.
-ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
-
-
 # --- Data Structures ---
+
+class ResumeContext:
+    """
+    A minimal stand-in for ``commands.Context`` used to drive playback when there
+    is no real command invocation — specifically when resuming a queue on startup.
+
+    ``play_next`` and ``on_song_end`` only ever touch ``.guild``, ``.channel`` and
+    ``.send`` on the context, so this exposes exactly those.
+    """
+    def __init__(self, guild: discord.Guild, channel: discord.abc.Messageable):
+        self.guild = guild
+        self.channel = channel
+
+    async def send(self, *args, **kwargs):
+        return await self.channel.send(*args, **kwargs)
+
 
 class Song:
     """
@@ -88,15 +218,74 @@ class Song:
     def __init__(self, data, requester):
         # The full data dictionary from yt-dlp, kept for creating the player source later.
         self.data = data
-        self.url = data.get('webpage_url')
+        # Fresh yt-dlp results carry 'webpage_url' (the page) and 'url' (the direct,
+        # expiring stream URL). Dicts restored from the database only have 'url',
+        # which is the *page* URL (see to_dict), so it must not be treated as a stream.
+        if 'webpage_url' in data:
+            self.url = data.get('webpage_url')
+            self.stream_url = data.get('url')
+        else:
+            self.url = data.get('url')
+            self.stream_url = None
         self.title = data.get('title', 'Unknown Title')
         self.thumbnail = data.get('thumbnail')
         self.duration = data.get('duration')
         self.uploader = data.get('uploader')
         self.requester = requester
         self.requester_id = requester.id
-        # The direct audio stream URL, which can expire.
-        self.stream_url = data.get('url')
+        # Set for unresolved placeholder songs (e.g. Spotify playlist tracks):
+        # the YouTube lookup for this query is deferred until just before playback.
+        self.search_query = data.get('search_query')
+        # When the stream URL was fetched; stream URLs expire after a few hours.
+        self.fetched_at = time.time() if self.stream_url else 0.0
+
+    @classmethod
+    def from_spotify_track(cls, track: dict, requester, album_info: dict = None) -> 'Song':
+        """
+        Creates an unresolved placeholder Song from Spotify track metadata.
+
+        The YouTube search is deferred until just before the song plays (or the
+        prefetcher warms it up), which makes adding large playlists instant.
+        """
+        artists = ", ".join(a['name'] for a in track.get('artists', []) if a.get('name'))
+        if not artists and album_info:
+            artists = ", ".join(a['name'] for a in album_info.get('artists', []) if a.get('name'))
+        images = (track.get('album') or {}).get('images') or (album_info or {}).get('images') or []
+        duration_ms = track.get('duration_ms')
+        data = {
+            'title': f"{track['name']} - {artists}" if artists else track['name'],
+            'uploader': artists or None,
+            'duration': (duration_ms // 1000) if duration_ms else None,
+            'thumbnail': images[0].get('url') if images else None,
+            'search_query': f"{track['name']} {artists}".strip(),
+        }
+        return cls(data, requester)
+
+    @classmethod
+    def from_youtube_entry(cls, entry: dict, requester) -> Union['Song', None]:
+        """
+        Creates a placeholder Song from a flat YouTube playlist entry.
+
+        The entry already carries the video's page URL, so the stream is resolved
+        lazily (like Spotify placeholders) just before playback.
+        """
+        video_id = entry.get('id')
+        webpage_url = entry.get('url')
+        if webpage_url and not webpage_url.startswith('http') and video_id:
+            webpage_url = None  # 'url' was just the bare id; rebuild it below.
+        if not webpage_url:
+            webpage_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+        if not webpage_url:
+            return None
+        thumbnails = entry.get('thumbnails') or []
+        data = {
+            'webpage_url': webpage_url,
+            'title': entry.get('title', 'Unknown Title'),
+            'duration': entry.get('duration'),
+            'uploader': entry.get('uploader') or entry.get('channel'),
+            'thumbnail': thumbnails[-1].get('url') if thumbnails else None,
+        }
+        return cls(data, requester)
 
     def to_dict(self):
         """
@@ -112,7 +301,9 @@ class Song:
             'thumbnail': self.thumbnail,
             'duration': self.duration,
             'uploader': self.uploader,
-            'requester_id': self.requester_id
+            'requester_id': self.requester_id,
+            # Persisted so unresolved placeholders survive restarts.
+            'search_query': self.search_query
         }
 
 
@@ -135,17 +326,26 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.uploader = data.get('uploader')
         self.requester = data.get('requester')
 
+    @staticmethod
+    def _ffmpeg_options(seek: int = 0) -> dict:
+        """FFmpeg options, optionally starting playback at a given offset (seconds)."""
+        if seek and seek > 0:
+            # -ss before the input seeks quickly by keyframe.
+            return {**ffmpeg_options,
+                    'before_options': f"{ffmpeg_options['before_options']} -ss {int(seek)}"}
+        return ffmpeg_options
+
     @classmethod
-    async def from_data(cls, data, *, volume=0.5):
+    async def from_data(cls, data, *, volume=0.5, seek=0):
         """
         Creates a YTDLSource instance directly from pre-fetched yt-dlp data.
         This is the "fast path" for playback as it avoids blocking network calls.
         """
         filename = data.get('url')
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data, volume=volume)
+        return cls(discord.FFmpegPCMAudio(filename, **cls._ffmpeg_options(seek)), data=data, volume=volume)
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False, requester=None, volume=0.5):
+    async def from_url(cls, url, *, loop=None, stream=False, requester=None, volume=0.5, seek=0):
         """
         Creates a YTDLSource by fetching info from a URL.
         This is the "slower path" or fallback, used for songs loaded from the
@@ -153,14 +353,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
         `extract_info` call in an executor to avoid stalling the bot's event loop.
         """
         loop = loop or asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        data = await loop.run_in_executor(None, lambda: extract_info_blocking(url, download=not stream))
 
         if 'entries' in data:
             data = data['entries'][0]
 
         data['requester'] = requester
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data, volume=volume)
+        filename = data['url'] if stream else create_ytdl().prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **cls._ffmpeg_options(seek)), data=data, volume=volume)
 
 
 # --- UI Views for Interactive Controls ---
@@ -286,22 +486,17 @@ class LoopControlsView(discord.ui.View):
             await interaction.response.send_message(f"✅ Loop mode force-set to **{mode}** by an admin.", ephemeral=True)
             return
 
-        # Calculate the required number of votes for a majority.
         vc = interaction.guild.voice_client
-        listeners = [member for member in vc.channel.members if not member.bot]
-        required_votes = (len(listeners) // 2) + 1
-
         guild_votes = self.cog.loop_votes.setdefault(interaction.guild.id, {})
         voters = guild_votes.setdefault(mode, set())
+        status, votes, required_votes = self.cog._tally_vote(vc, voters, interaction.user.id)
 
-        if interaction.user.id in voters:
+        if status == self.cog.VOTE_ALREADY:
             await interaction.response.send_message(f"ℹ️ You have already voted to set loop to **{mode}**.", ephemeral=True)
             return
 
-        voters.add(interaction.user.id)
-
         # Check if the vote threshold has been met.
-        if len(voters) >= required_votes:
+        if status == self.cog.VOTE_PASSED:
             self.cog.loop_states[interaction.guild.id] = mode
             self.cog.loop_votes.pop(interaction.guild.id, None)
             for item in self.children: item.disabled = True
@@ -310,7 +505,7 @@ class LoopControlsView(discord.ui.View):
             await interaction.response.send_message(f"🗳️ Vote passed! Loop mode has been set to **{mode}**.")
         else:
             await interaction.response.send_message(
-                f"🗳️ Your vote to set loop to **{mode}** was added. Now at **{len(voters)}/{required_votes}** votes.",
+                f"🗳️ Your vote to set loop to **{mode}** was added. Now at **{votes}/{required_votes}** votes.",
                 ephemeral=True)
 
     @discord.ui.button(label="Loop Song", emoji="🔂", style=discord.ButtonStyle.secondary, custom_id="loop_song")
@@ -393,6 +588,11 @@ class Music(commands.Cog):
     """The main cog for handling all music-related commands and events."""
     INACTIVITY_TIMEOUT_SECONDS = 120
     SONG_HISTORY_MAXLEN = 20
+    # Reuse a pre-fetched stream URL only while it is this fresh. YouTube stream
+    # URLs expire after ~6 hours; refresh well before that to avoid mid-queue failures.
+    STREAM_URL_TTL_SECONDS = 3600
+    # How long a cached "search text -> video" mapping stays valid.
+    SEARCH_CACHE_TTL_SECONDS = 7 * 24 * 3600
 
     def __init__(self, bot):
         self.bot = bot
@@ -405,6 +605,9 @@ class Music(commands.Cog):
         self.now_playing_messages: dict[int, discord.Message] = {} # guild_id: discord.Message
         self.guild_volumes: dict[int, int] = {}               # guild_id: int (0-200)
         self.inactive_since: dict[int, float] = {}            # guild_id: float (timestamp)
+        self.current_song: dict[int, Song] = {}               # guild_id: currently playing Song
+        self.autoplay_enabled: dict[int, bool] = {}           # guild_id: autoplay related tracks when queue empties
+        self.seek_in_progress: set[int] = set()               # guild_ids being seeked (suppress queue advance)
 
         # Vote Tracking Dictionaries
         self.skip_votes: dict[int, set[int]] = {}             # guild_id: {user_id, ...}
@@ -417,55 +620,226 @@ class Music(commands.Cog):
         self.loop_votes: dict[int, dict[str, set[int]]] = {}  # guild_id: {mode: {user_id, ...}}
 
         # Database and API Initialization
-        self.db_path = 'music_queue.db'
+        self.db_path = os.path.join(DATA_DIR, 'music_queue.db')
         self.sp = None
+
+        # Set once the background updater installs a new yt-dlp; the bot restarts
+        # to pick it up as soon as no guild is playing music.
+        self.pending_ytdlp_restart = False
 
         load_dotenv()
         try:
             client_id = os.getenv("SPOTIPY_CLIENT_ID")
             client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
             if not client_id or not client_secret:
-                raise ValueError("Spotify credentials not found in .env file.")
+                raise ValueError("SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET not set.")
             client_credentials_manager = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
             self.sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
-            print("✅ Spotipy initialized successfully from .env file.")
+            log.info("Spotipy initialized successfully.")
         except Exception as e:
-            print(f"❌ Could not initialize Spotipy. Spotify links will not work. Error: {e}")
+            log.warning("Could not initialize Spotipy. Spotify links will not work. Error: %s", e)
             self.sp = None
 
         self.bot.loop.create_task(self.initialize_database())
         self.auto_disconnect.start()
+        if os.getenv("YTDLP_AUTO_UPDATE", "1") not in ("0", "false", "False"):
+            self.ytdlp_update.start()
+
+    async def cog_load(self):
+        """Re-registers the persistent player controls so the buttons on old
+        'Now Playing' messages keep working after a restart."""
+        self.bot.add_view(PlayerControls(self, None))
+
+    def cog_unload(self):
+        """Cancels background tasks when the cog is unloaded."""
+        self.auto_disconnect.cancel()
+        self.ytdlp_update.cancel()
 
     # --- Internal Helper Methods ---
-    async def _process_playlist_in_background(self, ctx: commands.Context, search_queries: list):
-        """Processes a list of search queries in the background, adding them to the queue."""
-        requester = ctx.author
-        guild_id = ctx.guild.id
+    def _song_has_fresh_stream(self, song) -> bool:
+        """Whether the song's pre-fetched stream URL is still safe to play directly."""
+        return bool(
+            getattr(song, 'stream_url', None)
+            and getattr(song, 'data', None)
+            and (time.time() - getattr(song, 'fetched_at', 0)) < self.STREAM_URL_TTL_SECONDS
+        )
 
-        for query in search_queries:
-            # A small sleep helps distribute the load and avoid rate-limiting.
-            await asyncio.sleep(1)
-            song = await self._search_and_create_song(query, requester)
+    async def _refresh_song_data(self, song: Song) -> bool:
+        """
+        Fetches fresh YouTube data for a song, updating it in place.
+
+        Handles both unresolved placeholders (Spotify tracks that only carry a
+        search query) and songs whose direct stream URL has expired. Returns
+        False if nothing playable could be found.
+        """
+        query = song.url or song.search_query
+        if not query:
+            return False
+        resolved = await self._search_and_create_song(query, song.requester)
+        if not resolved:
+            return False
+        song.data = resolved.data
+        song.url = resolved.url
+        song.stream_url = resolved.stream_url
+        song.fetched_at = resolved.fetched_at
+        song.title = resolved.title or song.title
+        song.thumbnail = resolved.thumbnail or song.thumbnail
+        song.duration = resolved.duration or song.duration
+        song.uploader = resolved.uploader or song.uploader
+        return True
+
+    async def _prefetch_next(self, guild_id: int):
+        """
+        Resolves the upcoming song while the current one plays, so the transition
+        between songs is gapless instead of pausing for a YouTube lookup.
+        """
+        queue = self.queues.get(guild_id)
+        if not queue:
+            return
+        song = queue[0]
+        if self._song_has_fresh_stream(song):
+            return
+        try:
+            if await self._refresh_song_data(song):
+                await self.save_queue_to_db(guild_id)
+        except Exception:
+            log.debug("Prefetching the next song failed", exc_info=True)
+
+    @staticmethod
+    def _youtube_id(url: str) -> Union[str, None]:
+        """Extracts the 11-character video id from a YouTube URL, or None."""
+        if not url:
+            return None
+        parsed = urllib.parse.urlparse(url)
+        if "youtu.be" in parsed.netloc:
+            return parsed.path.lstrip("/") or None
+        if "youtube.com" in parsed.netloc:
+            return urllib.parse.parse_qs(parsed.query).get("v", [None])[0]
+        return None
+
+    async def _enqueue_autoplay(self, guild_id: int) -> bool:
+        """
+        Appends a related track to the queue using YouTube's mix (radio) list for
+        the last played song. Skips anything already in the recent history so the
+        radio doesn't loop on itself. Returns True if a track was added.
+        """
+        last = self.current_song.get(guild_id)
+        video_id = self._youtube_id(last.url) if last else None
+        if not video_id:
+            return False
+
+        mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+        try:
+            loop = self.bot.loop or asyncio.get_running_loop()
+            entries = await loop.run_in_executor(None, lambda: extract_flat_playlist_blocking(mix_url))
+        except Exception:
+            log.debug("Autoplay mix fetch failed", exc_info=True)
+            return False
+
+        history = self.song_history.get(guild_id) or deque()
+        recent_ids = {self._youtube_id(s.url) for s in history}
+        recent_ids.add(video_id)
+
+        for entry in entries:
+            if not entry:
+                continue
+            if entry.get("id") in recent_ids:
+                continue
+            song = Song.from_youtube_entry(entry, self.bot.user)
             if song:
                 self.queues.setdefault(guild_id, []).append(song)
                 await self.save_queue_to_db(guild_id)
+                return True
+        return False
+
+    async def _youtube_playlist_songs(self, url: str, requester: discord.Member) -> list:
+        """Flat-extracts a YouTube playlist into a list of placeholder Songs."""
+        loop = self.bot.loop or asyncio.get_running_loop()
+        entries = await loop.run_in_executor(None, lambda: extract_flat_playlist_blocking(url))
+        songs = []
+        for entry in entries:
+            if not entry:
+                continue
+            song = Song.from_youtube_entry(entry, requester)
+            if song:
+                songs.append(song)
+        return songs
+
+    @staticmethod
+    def _is_url(query: str) -> bool:
+        """Whether a query is a URL rather than free-text search terms."""
+        return query.startswith("http://") or query.startswith("https://")
+
+    async def _search_cache_get(self, query: str) -> Union[dict, None]:
+        """Returns cached video metadata for a search query, or None if absent/expired."""
+        key = query.strip().lower()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute("SELECT data, cached_at FROM search_cache WHERE query = ?", (key,)) as cursor:
+                    row = await cursor.fetchone()
+                    if not row:
+                        return None
+                    data_json, cached_at = row
+                    if time.time() - cached_at > self.SEARCH_CACHE_TTL_SECONDS:
+                        await db.execute("DELETE FROM search_cache WHERE query = ?", (key,))
+                        await db.commit()
+                        return None
+                    return json.loads(data_json)
+        except Exception:
+            log.debug("Search cache read failed", exc_info=True)
+            return None
+
+    async def _search_cache_put(self, query: str, song: Song):
+        """Stores a resolved song's non-expiring metadata for a search query."""
+        key = query.strip().lower()
+        payload = {
+            'webpage_url': song.url,
+            'title': song.title,
+            'duration': song.duration,
+            'uploader': song.uploader,
+            'thumbnail': song.thumbnail,
+        }
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO search_cache (query, data, cached_at) VALUES (?, ?, ?)",
+                    (key, json.dumps(payload), int(time.time())))
+                await db.commit()
+        except Exception:
+            log.debug("Search cache write failed", exc_info=True)
 
     async def _search_and_create_song(self, query: str, requester: discord.Member) -> Union[Song, None]:
-        """Searches for a query using yt-dlp and creates a Song object from the result."""
+        """
+        Searches for a query using yt-dlp and creates a Song object from the result.
+
+        For free-text searches the resolved query->video mapping is cached, so a
+        repeated request returns instantly as a placeholder (resolved to a fresh
+        stream at play time) without hitting YouTube's search again.
+        """
+        is_text_search = not self._is_url(query)
+        if is_text_search:
+            cached = await self._search_cache_get(query)
+            if cached and cached.get('webpage_url'):
+                return Song(cached, requester)
+
         try:
             loop = self.bot.loop or asyncio.get_running_loop()
             # Run the blocking yt-dlp search in an executor to avoid stalling the bot.
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
+            data = await loop.run_in_executor(None, lambda: extract_info_blocking(query, download=False))
             if not data: return None
             # For searches, yt-dlp returns a playlist; we take the first entry.
             if 'entries' in data:
                 if not data['entries']: return None
                 data = data['entries'][0]
             data['requester'] = requester
-            return Song(data, requester)
+            song = Song(data, requester)
         except Exception:
             traceback.print_exc()
             return None
+
+        if is_text_search and song.url:
+            await self._search_cache_put(query, song)
+        return song
 
     async def _cleanup_player_message(self, guild_id: int):
         """
@@ -485,10 +859,13 @@ class Music(commands.Cog):
         guild_id = vc.guild.id
         self.queues.pop(guild_id, None)
         await self.save_queue_to_db(guild_id)
+        await self.clear_session(guild_id)
         await self._cleanup_player_message(guild_id)
         # Reset all state for the guild to ensure a fresh start next time.
         self.loop_states.pop(guild_id, None)
         self.song_start_times.pop(guild_id, None)
+        self.current_song.pop(guild_id, None)
+        self.autoplay_enabled.pop(guild_id, None)
         self.voice_clients.pop(guild_id, None)
         self.inactive_since.pop(guild_id, None)
         if vc.is_connected():
@@ -520,15 +897,57 @@ class Music(commands.Cog):
         else:
             await context_data["channel"].send(*args, **kwargs)
 
+    # --- Vote Tallying ---
+    # Outcomes returned by _tally_vote.
+    VOTE_ALREADY = "already"   # this user had already voted
+    VOTE_PASSED = "passed"     # this vote met the majority threshold
+    VOTE_PENDING = "pending"   # vote counted, threshold not yet reached
+
+    @staticmethod
+    def _required_votes(vc) -> int:
+        """Majority of the non-bot listeners in the bot's voice channel."""
+        listeners = [member for member in vc.channel.members if not member.bot]
+        return (len(listeners) // 2) + 1
+
+    def _tally_vote(self, vc, voters: set, user_id: int):
+        """
+        Records a single majority vote and reports the outcome.
+
+        Centralizes the vote-counting arithmetic that every vote-based command
+        shares. Returns ``(status, current_votes, required_votes)`` where status
+        is one of VOTE_ALREADY, VOTE_PASSED or VOTE_PENDING. On VOTE_PASSED the
+        caller is responsible for both performing the action and clearing the
+        relevant vote set.
+        """
+        required = self._required_votes(vc)
+        if user_id in voters:
+            return self.VOTE_ALREADY, len(voters), required
+        voters.add(user_id)
+        if len(voters) >= required:
+            return self.VOTE_PASSED, len(voters), required
+        return self.VOTE_PENDING, len(voters), required
+
     # --- Database & State Persistence ---
     async def initialize_database(self):
         """Initializes the SQLite database and creates tables if they don't exist."""
+        # The guild cache must be populated before load_queues_from_db, otherwise
+        # every queue is skipped because bot.get_guild returns None.
+        await self.bot.wait_until_ready()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('CREATE TABLE IF NOT EXISTS queues (guild_id INTEGER PRIMARY KEY, queue_data TEXT NOT NULL)')
             await db.execute('CREATE TABLE IF NOT EXISTS guild_settings (guild_id INTEGER PRIMARY KEY, volume INTEGER DEFAULT 50)')
+            # Remembers which voice/text channel a guild was using so playback can
+            # resume automatically after a restart or redeploy.
+            await db.execute('CREATE TABLE IF NOT EXISTS guild_sessions '
+                             '(guild_id INTEGER PRIMARY KEY, voice_channel_id INTEGER NOT NULL, text_channel_id INTEGER NOT NULL)')
+            # Caches "search text -> resolved YouTube video metadata" so repeated
+            # songs skip the YouTube search step.
+            await db.execute('CREATE TABLE IF NOT EXISTS search_cache '
+                             '(query TEXT PRIMARY KEY, data TEXT NOT NULL, cached_at INTEGER NOT NULL)')
             await db.commit()
         await self.load_queues_from_db()
         await self.load_volumes_from_db()
+        await self.resume_sessions()
 
     async def load_queues_from_db(self):
         """Loads all guild queues from the database into memory on startup."""
@@ -544,7 +963,7 @@ class Music(commands.Cog):
                         # Reconstruct the requester Member object from the stored ID.
                         requester = guild.get_member(song_dict['requester_id']) or self.bot.user
                         self.queues[guild_id].append(Song(song_dict, requester))
-        print("✅ Queues loaded from database.")
+        log.info("Queues loaded from database.")
 
     async def load_volumes_from_db(self):
         """Loads all guild volume settings from the database into memory on startup."""
@@ -553,7 +972,7 @@ class Music(commands.Cog):
                 async for row in cursor:
                     guild_id, volume = row
                     self.guild_volumes[guild_id] = volume
-        print("✅ Guild volumes loaded from database.")
+        log.info("Guild volumes loaded from database.")
 
     async def save_queue_to_db(self, guild_id):
         """Saves a guild's current queue to the database."""
@@ -574,7 +993,83 @@ class Music(commands.Cog):
             await db.execute("INSERT OR REPLACE INTO guild_settings (guild_id, volume) VALUES (?, ?)", (guild_id, volume))
             await db.commit()
 
+    async def save_session(self, guild_id: int, voice_channel_id: int, text_channel_id: int):
+        """Records the voice/text channel in use so playback can resume after a restart."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO guild_sessions (guild_id, voice_channel_id, text_channel_id) VALUES (?, ?, ?)",
+                (guild_id, voice_channel_id, text_channel_id))
+            await db.commit()
+
+    async def clear_session(self, guild_id: int):
+        """Forgets a guild's saved session so it won't try to resume."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM guild_sessions WHERE guild_id = ?", (guild_id,))
+            await db.commit()
+
+    async def resume_sessions(self):
+        """
+        Rejoins voice channels and resumes queued playback after a restart.
+
+        Runs once on startup. A guild is resumed only if it still has a saved
+        queue and at least one human is in the saved voice channel; otherwise the
+        stale session is discarded. This makes restarts (including the automatic
+        yt-dlp update restart) invisible to listeners.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT guild_id, voice_channel_id, text_channel_id FROM guild_sessions") as cursor:
+                sessions = await cursor.fetchall()
+
+        for guild_id, voice_channel_id, text_channel_id in sessions:
+            queue = self.queues.get(guild_id)
+            guild = self.bot.get_guild(guild_id)
+            voice_channel = guild.get_channel(voice_channel_id) if guild else None
+            text_channel = guild.get_channel(text_channel_id) if guild else None
+
+            # Discard the session if there's nothing to resume, the channels are
+            # gone, or nobody is left listening.
+            if (not queue or not isinstance(voice_channel, discord.VoiceChannel)
+                    or text_channel is None
+                    or not any(not m.bot for m in voice_channel.members)):
+                await self.clear_session(guild_id)
+                continue
+
+            try:
+                vc = await voice_channel.connect(self_deaf=True)
+                self.voice_clients[guild_id] = vc
+            except Exception:
+                log.exception("Failed to rejoin voice for guild %s on resume", guild_id)
+                continue
+
+            try:
+                await text_channel.send(embed=discord.Embed(
+                    description="🔄 Resuming the queue after a restart.", color=discord.Color.blurple()))
+            except discord.HTTPException:
+                pass
+            log.info("Resuming playback for guild %s", guild_id)
+            await self.play_next(ResumeContext(guild, text_channel))
+
     # --- Core Playback Engine ---
+    def _make_after(self, ctx, song):
+        """
+        Builds the ``after`` callback that advances the queue when a song ends.
+
+        Runs in the voice thread, so it schedules onto the event loop. If a seek
+        is in progress for the guild it does nothing — seeking stops the player to
+        swap in a new source and must not advance the queue.
+        """
+        guild_id = ctx.guild.id
+
+        def after_playback(error):
+            if error:
+                log.error("Playback error in guild %s: %s", guild_id, error)
+            if guild_id in self.seek_in_progress:
+                self.seek_in_progress.discard(guild_id)
+                return
+            asyncio.run_coroutine_threadsafe(self.on_song_end(ctx, song), self.bot.loop)
+
+        return after_playback
+
     async def on_song_end(self, ctx, finished_song_data):
         """
         Callback function that is executed automatically after a song finishes playing.
@@ -623,33 +1118,73 @@ class Music(commands.Cog):
 
             next_song = self.queues[guild_id].pop(0)
             guild_volume = self.guild_volumes.get(guild_id, 50)
+            volume = guild_volume / 100.0
 
+            # Placeholder songs (e.g. Spotify playlist tracks) have no URL yet and
+            # are resolved here, at play time, unless the prefetcher already did it.
+            if not getattr(next_song, 'url', None):
+                resolved = False
+                try:
+                    resolved = await self._refresh_song_data(next_song)
+                except Exception:
+                    log.exception("Failed to resolve %r", next_song.title)
+                if not resolved:
+                    await ctx.send(embed=discord.Embed(
+                        title="❌ Playback Error",
+                        description=f"Could not find a playable video for `{next_song.title}`. Skipping.",
+                        color=discord.Color.red()))
+                    return await self.on_song_end(ctx, None)
+
+            # Fast path is only safe while the pre-fetched stream URL is fresh;
+            # YouTube stream URLs expire and then FFmpeg fails with a 403.
+            stream_fresh = self._song_has_fresh_stream(next_song)
+
+            player = None
             try:
-                # Fast path: If the song has a pre-fetched stream URL, use it.
-                if hasattr(next_song, 'stream_url') and next_song.stream_url:
-                    player = await YTDLSource.from_data(next_song.data, volume=guild_volume / 100.0)
-                # Fallback path: If it's a song from the DB, re-fetch the stream URL.
+                if stream_fresh:
+                    player = await YTDLSource.from_data(next_song.data, volume=volume)
                 else:
+                    # Re-fetch a fresh stream URL from the page URL.
                     player = await YTDLSource.from_url(
                         next_song.url, loop=self.bot.loop, stream=True,
-                        requester=next_song.requester, volume=guild_volume / 100.0
+                        requester=next_song.requester, volume=volume
                     )
-            except Exception as e:
+            except Exception:
+                log.exception("Failed to create player for %r", next_song.title)
+                # If the cached data was the problem, retry once with a fresh extraction.
+                if stream_fresh and next_song.url:
+                    try:
+                        player = await YTDLSource.from_url(
+                            next_song.url, loop=self.bot.loop, stream=True,
+                            requester=next_song.requester, volume=volume
+                        )
+                    except Exception:
+                        log.exception("Retry with fresh extraction also failed for %r", next_song.title)
+
+            if player is None:
                 await ctx.send(embed=discord.Embed(
                     title="❌ Playback Error",
                     description=f"Could not play `{next_song.title}`.\nIt may be unavailable or restricted.\nSkipping.",
                     color=discord.Color.red()))
-                traceback.print_exc()
                 return await self.on_song_end(ctx, None)
 
             try:
-                # The 'after' parameter registers the on_song_end callback to run when playback finishes.
-                vc.play(player, after=lambda e: self.bot.loop.create_task(self.on_song_end(ctx, next_song)))
+                vc.play(player, after=self._make_after(ctx, next_song))
             except discord.ClientException:
                 # This can happen if the bot disconnects while trying to play.
                 return
 
+            self.current_song[guild_id] = next_song
             self.song_start_times[guild_id] = time.time()
+
+            # Remember where we're playing so the queue can resume after a restart.
+            channel = getattr(ctx, 'channel', None)
+            if channel is not None:
+                await self.save_session(guild_id, vc.channel.id, channel.id)
+
+            # Warm up the next song in the background for a gapless transition.
+            if self.queues.get(guild_id):
+                self.bot.loop.create_task(self._prefetch_next(guild_id))
 
             # Create and send the 'Now Playing' embed with controls.
             embed = discord.Embed(title="🎶 Now Playing", description=f"[{player.title}]({player.url})", color=discord.Color.blue())
@@ -668,8 +1203,16 @@ class Music(commands.Cog):
             await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.playing, name=player.title))
             await self.save_queue_to_db(guild_id)
         else:
+            # Autoplay: when the queue empties, try to keep the music going with a
+            # related track before declaring the queue finished.
+            if self.autoplay_enabled.get(guild_id) and await self._enqueue_autoplay(guild_id):
+                return await self.play_next(ctx)
+
             # If the queue is empty, reset presence and mark the bot as inactive for auto-disconnection.
             self.song_start_times.pop(guild_id, None)
+            self.current_song.pop(guild_id, None)
+            # Nothing left to resume, so forget the saved session.
+            await self.clear_session(guild_id)
             await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f"{self.bot.command_prefix}play"))
             await ctx.send(embed=discord.Embed(description="✅ Queue finished.", color=discord.Color.green()))
             self.inactive_since[guild_id] = time.time()
@@ -678,12 +1221,27 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
         """Listener that triggers on voice state changes to detect if the bot is left alone."""
+        # If the bot itself was disconnected (kicked, channel deleted), clean up its state
+        # so the next !play starts from a consistent slate.
+        if member.id == self.bot.user.id and before.channel is not None and after.channel is None:
+            guild_id = member.guild.id
+            await self._cleanup_player_message(guild_id)
+            await self.clear_session(guild_id)
+            self.voice_clients.pop(guild_id, None)
+            self.song_start_times.pop(guild_id, None)
+            self.inactive_since.pop(guild_id, None)
+            return
+
         # Ignore bots' voice state changes.
         if not member.bot and after.channel is None:
             vc = member.guild.voice_client
             # If the bot is in a channel and there's only 1 member left (the bot itself)...
             if vc and len(vc.channel.members) == 1:
                 await self._handle_disconnect(vc)
+
+    def _any_voice_activity(self) -> bool:
+        """Returns True if any guild is currently playing or has playback paused."""
+        return any(vc.is_playing() or vc.is_paused() for vc in self.bot.voice_clients)
 
     @tasks.loop(seconds=30)
     async def auto_disconnect(self):
@@ -699,18 +1257,56 @@ class Music(commands.Cog):
                             pass # Channel might not be accessible.
                         await self._handle_disconnect(guild.voice_client)
 
+        # If a yt-dlp update is waiting and nothing is playing anywhere, exit cleanly.
+        # The container's restart policy brings the bot back up on the new version.
+        if self.pending_ytdlp_restart and not self._any_voice_activity():
+            log.info("Restarting bot to apply the pending yt-dlp update.")
+            await self.bot.close()
+
+    @auto_disconnect.before_loop
+    async def before_auto_disconnect(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(hours=6)
+    async def ytdlp_update(self):
+        """
+        Periodically upgrades yt-dlp.
+
+        YouTube regularly changes its player in ways that break older yt-dlp
+        releases, so staying current is the single most important thing for
+        keeping playback working 24/7. If pip installs a new version, a restart
+        is scheduled for the next moment the bot is idle.
+        """
+        try:
+            updated = await asyncio.get_running_loop().run_in_executor(None, _upgrade_ytdlp_blocking)
+        except Exception:
+            log.exception("yt-dlp update check failed")
+            return
+        if updated:
+            log.info("A new yt-dlp version was installed; will restart when idle to apply it.")
+            self.pending_ytdlp_restart = True
+
+    @ytdlp_update.before_loop
+    async def before_ytdlp_update(self):
+        await self.bot.wait_until_ready()
+
     # --- User-Facing Commands ---
-    @commands.command(name='play', aliases=['p'])
+    @commands.hybrid_command(name='play', aliases=['p'])
     async def play(self, ctx, *, query: str = None):
         """Plays a song from a URL or search query, or resumes playback."""
         if not ctx.author.voice:
             return await ctx.send(embed=discord.Embed(description="❌ You are not in a voice channel.", color=discord.Color.red()))
 
+        # Acknowledge early: connecting to voice and searching can exceed the 3s
+        # window a slash interaction allows before it expires. Harmless (shows
+        # typing) for prefix invocations.
+        await ctx.defer()
+
         vc = ctx.voice_client
         was_playing = vc and (vc.is_playing() or vc.is_paused())
 
         if not vc:
-            vc = await ctx.author.voice.channel.connect()
+            vc = await ctx.author.voice.channel.connect(self_deaf=True)
             self.voice_clients[ctx.guild.id] = vc
 
         if vc and vc.is_paused() and query is None:
@@ -727,13 +1323,21 @@ class Music(commands.Cog):
         processing_embed = await ctx.send(embed=discord.Embed(description="🔎 Processing request...", color=discord.Color.yellow()))
 
         search_queries = []
+        placeholder_songs = []
         is_playlist = False
         try:
             # A more robust check for spotify links.
             parsed_url = urllib.parse.urlparse(query)
             is_spotify_link = "spotify.com" in parsed_url.netloc
-        except:
+            # Treat a link as a YouTube playlist only when it's a pure playlist URL
+            # (has 'list' but no 'v'); a normal 'watch?v=…&list=…' plays the single
+            # video, which also avoids expanding autogenerated radio/mix lists.
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            is_youtube = any(h in parsed_url.netloc for h in ("youtube.com", "youtu.be"))
+            is_youtube_playlist = is_youtube and "list" in query_params and "v" not in query_params
+        except Exception:
             is_spotify_link = False
+            is_youtube_playlist = False
 
         # Spotify link processing logic
         if is_spotify_link and self.sp:
@@ -763,37 +1367,38 @@ class Music(commands.Cog):
                     for item in items:
                         track = item if "album" in query else item.get('track')
                         if track and track.get('name'):
-                            artist_names = ", ".join([artist['name'] for artist in track['artists']])
-                            if not artist_names and album_info:
-                                artist_names = ", ".join([artist['name'] for artist in album_info['artists']])
-                            search_queries.append(f"{track['name']} {artist_names}")
+                            # Queued as unresolved placeholders; the YouTube search
+                            # happens lazily just before each track plays.
+                            placeholder_songs.append(Song.from_spotify_track(track, ctx.author, album_info))
             except Exception:
                 traceback.print_exc()
                 return await processing_embed.edit(embed=discord.Embed(title="❌ Spotify Error", description="Could not process the Spotify link. It may be invalid or private.", color=discord.Color.red()))
+        # YouTube playlist processing logic
+        elif is_youtube_playlist:
+            await processing_embed.edit(embed=discord.Embed(description="🎶 Found a YouTube playlist, getting info...", color=discord.Color.green()))
+            try:
+                placeholder_songs = await self._youtube_playlist_songs(query, ctx.author)
+                is_playlist = True
+            except Exception:
+                traceback.print_exc()
+                return await processing_embed.edit(embed=discord.Embed(title="❌ YouTube Error", description="Could not process the YouTube playlist. It may be private or unavailable.", color=discord.Color.red()))
         else:
             search_queries.append(query)
 
-        if not search_queries:
+        if not search_queries and not placeholder_songs:
             return await processing_embed.edit(embed=discord.Embed(title="❌ Nothing Found", description="Could not find any songs to add from the provided link.", color=discord.Color.red()))
 
         queue = self.queues.setdefault(ctx.guild.id, [])
 
-        # Playlist handling: add the first song immediately, then process the rest in the background.
+        # Playlist handling: all tracks are queued instantly as placeholders and a
+        # single database write covers the whole batch. Tracks that turn out to
+        # have no playable YouTube match are reported (and skipped) at play time.
         if is_playlist:
-            await processing_embed.edit(embed=discord.Embed(description=f"✅ Playlist detected! Starting the first song and adding **{len(search_queries)}** others in the background.", color=discord.Color.green()))
-            first_song = None
-            for i, individual_query in enumerate(search_queries):
-                song = await self._search_and_create_song(individual_query, ctx.author)
-                if song:
-                    first_song = song
-                    queue.append(first_song)
-                    await self.save_queue_to_db(ctx.guild.id)
-                    remaining_queries = search_queries[i + 1:]
-                    if remaining_queries:
-                        self.bot.loop.create_task(self._process_playlist_in_background(ctx, remaining_queries))
-                    break
-            if not first_song:
-                return await processing_embed.edit(embed=discord.Embed(title="❌ Could Not Find Songs", description="Could not find any playable YouTube videos for your playlist.", color=discord.Color.red()))
+            queue.extend(placeholder_songs)
+            await self.save_queue_to_db(ctx.guild.id)
+            await processing_embed.edit(embed=discord.Embed(
+                description=f"✅ Added **{len(placeholder_songs)}** tracks to the queue.",
+                color=discord.Color.green()))
         # Single song handling
         else:
             song = await self._search_and_create_song(search_queries[0], ctx.author)
@@ -813,7 +1418,7 @@ class Music(commands.Cog):
         if not was_playing:
             await self.play_next(ctx)
 
-    @commands.command(name='volume', aliases=['vol'])
+    @commands.hybrid_command(name='volume', aliases=['vol'])
     async def volume(self, ctx, volume: int = None):
         """Sets the player's volume (0-200), saved permanently for the server."""
         vc = ctx.voice_client
@@ -833,7 +1438,7 @@ class Music(commands.Cog):
         await self.save_volume_to_db(ctx.guild.id, volume)
         await ctx.send(embed=discord.Embed(description=f"✅ Volume permanently set to **{volume}%**.", color=discord.Color.green()))
 
-    @commands.command(name='nowplaying', aliases=['np', 'now'])
+    @commands.hybrid_command(name='nowplaying', aliases=['np', 'now'])
     async def nowplaying(self, ctx):
         """Displays detailed information about the currently playing song."""
         vc = ctx.voice_client
@@ -858,7 +1463,83 @@ class Music(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @commands.command(name='loop')
+    @staticmethod
+    def _parse_timestamp(text: str) -> Union[int, None]:
+        """Parses 'SS', 'MM:SS' or 'HH:MM:SS' into seconds. Returns None if invalid."""
+        if not text:
+            return None
+        try:
+            parts = [int(p) for p in text.strip().split(":")]
+        except ValueError:
+            return None
+        if not 1 <= len(parts) <= 3 or any(p < 0 for p in parts):
+            return None
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + part
+        return seconds
+
+    @commands.hybrid_command(name='seek')
+    async def seek(self, ctx, *, position: str = None):
+        """Jumps to a position in the current song (e.g. `!seek 1:30`)."""
+        vc = ctx.voice_client
+        if not vc or not vc.source or not (vc.is_playing() or vc.is_paused()):
+            return await ctx.send(embed=discord.Embed(description="❌ I'm not playing anything to seek.", color=discord.Color.red()))
+
+        if position is None:
+            return await ctx.send(embed=discord.Embed(description="ℹ️ Usage: `!seek <seconds | MM:SS | HH:MM:SS>`.", color=discord.Color.blue()))
+
+        seconds = self._parse_timestamp(position)
+        if seconds is None:
+            return await ctx.send(embed=discord.Embed(description="❌ Invalid position. Try `90`, `1:30` or `1:02:03`.", color=discord.Color.red()))
+
+        source = vc.source
+        song = self.current_song.get(ctx.guild.id)
+        seek_url = song.url if song else getattr(source, 'url', None)
+        if source.duration and seconds >= source.duration:
+            return await ctx.send(embed=discord.Embed(description=f"❌ That's past the end of the song ({source.duration}s).", color=discord.Color.red()))
+        if not seek_url:
+            return await ctx.send(embed=discord.Embed(description="❌ I can't seek this source.", color=discord.Color.red()))
+
+        # Re-extracting the stream can exceed the slash 3s window.
+        await ctx.defer()
+
+        try:
+            new_source = await YTDLSource.from_url(
+                seek_url, loop=self.bot.loop, stream=True,
+                requester=source.requester, volume=source.volume, seek=seconds)
+        except Exception:
+            log.exception("Seek failed to build source")
+            return await ctx.send(embed=discord.Embed(description="❌ Could not seek — the stream may have expired.", color=discord.Color.red()))
+
+        # Suppress the queue-advance that vc.stop() would otherwise trigger.
+        self.seek_in_progress.add(ctx.guild.id)
+        vc.stop()
+        try:
+            vc.play(new_source, after=self._make_after(ctx, song))
+        except discord.ClientException:
+            self.seek_in_progress.discard(ctx.guild.id)
+            return await ctx.send(embed=discord.Embed(description="❌ Could not resume after seeking.", color=discord.Color.red()))
+
+        self.current_song[ctx.guild.id] = song
+        # Back-date the start time so the nowplaying progress bar stays accurate.
+        self.song_start_times[ctx.guild.id] = time.time() - seconds
+        await ctx.send(embed=discord.Embed(
+            description=f"⏩ Seeked to **{time.strftime('%M:%S', time.gmtime(seconds))}**.",
+            color=discord.Color.green()))
+
+    @commands.hybrid_command(name='autoplay', aliases=['radio'])
+    async def autoplay(self, ctx):
+        """Toggles autoplay: when the queue empties, related tracks keep playing."""
+        guild_id = ctx.guild.id
+        enabled = not self.autoplay_enabled.get(guild_id, False)
+        self.autoplay_enabled[guild_id] = enabled
+        if enabled:
+            await ctx.send(embed=discord.Embed(description="📻 Autoplay **enabled** — I'll keep the music going with related tracks.", color=discord.Color.green()))
+        else:
+            await ctx.send(embed=discord.Embed(description="⏹️ Autoplay **disabled**.", color=discord.Color.blue()))
+
+    @commands.hybrid_command(name='loop')
     async def loop(self, ctx, mode: str = None):
         """Sets the loop mode (off, song, queue) via command or interactive view."""
         if mode:
@@ -875,21 +1556,18 @@ class Music(commands.Cog):
             if not ctx.author.voice or not vc or ctx.author.voice.channel != vc.channel:
                 return await ctx.send(embed=discord.Embed(description="❌ You must be in my voice channel to vote.", color=discord.Color.red()))
 
-            listeners = [member for member in vc.channel.members if not member.bot]
-            required_votes = (len(listeners) // 2) + 1
             guild_votes = self.loop_votes.setdefault(ctx.guild.id, {})
             voters = guild_votes.setdefault(mode, set())
+            status, votes, required_votes = self._tally_vote(vc, voters, ctx.author.id)
 
-            if ctx.author.id in voters:
+            if status == self.VOTE_ALREADY:
                 return await ctx.send(embed=discord.Embed(description=f"ℹ️ You have already voted to set loop to **{mode}**.", color=discord.Color.yellow()))
-            voters.add(ctx.author.id)
-
-            if len(voters) >= required_votes:
+            if status == self.VOTE_PASSED:
                 self.loop_states[ctx.guild.id] = mode
                 self.loop_votes.pop(ctx.guild.id, None)
                 await ctx.send(embed=discord.Embed(description=f"🗳️ Vote passed! Loop mode set to **{mode}**.", color=discord.Color.green()))
             else:
-                await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to set loop to **{mode}** added. **{len(voters)}/{required_votes}** votes now.", color=discord.Color.blue()))
+                await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to set loop to **{mode}** added. **{votes}/{required_votes}** votes now.", color=discord.Color.blue()))
             return
 
         # If no mode is provided, show the interactive view.
@@ -899,7 +1577,7 @@ class Music(commands.Cog):
         message = await ctx.send(embed=embed, view=view)
         view.message = message
 
-    @commands.command(name='disconnect', aliases=['leave', 'dc'])
+    @commands.hybrid_command(name='disconnect', aliases=['leave', 'dc'])
     async def disconnect(self, ctx):
         """Disconnects the bot from the voice channel via a vote."""
         vc = ctx.voice_client
@@ -914,22 +1592,19 @@ class Music(commands.Cog):
             await self._handle_disconnect(vc)
             return await ctx.send(embed=discord.Embed(description="👋 Force-disconnected by an admin.", color=discord.Color.blue()))
 
-        listeners = [member for member in vc.channel.members if not member.bot]
-        required_votes = (len(listeners) // 2) + 1
         voters = self.disconnect_votes.setdefault(ctx.guild.id, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, ctx.author.id)
 
-        if ctx.author.id in voters:
+        if status == self.VOTE_ALREADY:
             return await ctx.send(embed=discord.Embed(description="ℹ️ You have already voted to disconnect.", color=discord.Color.yellow()))
-        voters.add(ctx.author.id)
-
-        if len(voters) >= required_votes:
+        if status == self.VOTE_PASSED:
             await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f"{self.bot.command_prefix}play"))
             await self._handle_disconnect(vc)
-            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote passed! ({len(voters)}/{required_votes}). Disconnecting.", color=discord.Color.blue()))
+            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote passed! ({votes}/{required_votes}). Disconnecting.", color=discord.Color.blue()))
         else:
-            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to disconnect added. **{len(voters)}/{required_votes}** votes now.", color=discord.Color.blue()))
+            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to disconnect added. **{votes}/{required_votes}** votes now.", color=discord.Color.blue()))
 
-    @commands.command(name='queue', aliases=['q'])
+    @commands.hybrid_command(name='queue', aliases=['q'])
     async def queue(self, ctx):
         """Displays the current song queue with pagination."""
         vc = ctx.voice_client
@@ -943,7 +1618,7 @@ class Music(commands.Cog):
         initial_embed = await paginator.get_page_embed()
         await ctx.send(embed=initial_embed, view=paginator)
 
-    @commands.command(name='shuffle', aliases=['shuf'])
+    @commands.hybrid_command(name='shuffle', aliases=['shuf'])
     async def shuffle(self, ctx):
         """Shuffles the current queue via a vote."""
         guild_queue = self.queues.get(ctx.guild.id)
@@ -959,23 +1634,20 @@ class Music(commands.Cog):
             await self.save_queue_to_db(ctx.guild.id)
             return await ctx.send(embed=discord.Embed(description="🔀 Queue has been force-shuffled by an admin.", color=discord.Color.green()))
 
-        listeners = [member for member in vc.channel.members if not member.bot]
-        required_votes = (len(listeners) // 2) + 1
         voters = self.shuffle_votes.setdefault(ctx.guild.id, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, ctx.author.id)
 
-        if ctx.author.id in voters:
+        if status == self.VOTE_ALREADY:
             return await ctx.send(embed=discord.Embed(description="ℹ️ You have already voted to shuffle.", color=discord.Color.yellow()))
-        voters.add(ctx.author.id)
-
-        if len(voters) >= required_votes:
+        if status == self.VOTE_PASSED:
             random.shuffle(guild_queue)
             await self.save_queue_to_db(ctx.guild.id)
             self.shuffle_votes.pop(ctx.guild.id, None)
-            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote passed! ({len(voters)}/{required_votes}). The queue has been shuffled.", color=discord.Color.green()))
+            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote passed! ({votes}/{required_votes}). The queue has been shuffled.", color=discord.Color.green()))
         else:
-            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to shuffle added. **{len(voters)}/{required_votes}** votes now, need **{required_votes}** to pass.", color=discord.Color.blue()))
+            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to shuffle added. **{votes}/{required_votes}** votes now, need **{required_votes}** to pass.", color=discord.Color.blue()))
 
-    @commands.command(name='remove', aliases=['rm'])
+    @commands.hybrid_command(name='remove', aliases=['rm'])
     async def remove(self, ctx, number: int):
         """Removes a specific song from the queue by its number, via a vote."""
         guild_queue = self.queues.get(ctx.guild.id)
@@ -996,24 +1668,21 @@ class Music(commands.Cog):
             self.remove_votes.pop(ctx.guild.id, None)
             return await ctx.send(embed=discord.Embed(description=f"✅ Force-removed **{removed_song.title}** from the queue.", color=discord.Color.green()))
 
-        listeners = [member for member in vc.channel.members if not member.bot]
-        required_votes = (len(listeners) // 2) + 1
         guild_votes = self.remove_votes.setdefault(ctx.guild.id, {})
         voters = guild_votes.setdefault(number, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, ctx.author.id)
 
-        if ctx.author.id in voters:
+        if status == self.VOTE_ALREADY:
             return await ctx.send(embed=discord.Embed(description=f"ℹ️ You have already voted to remove song #{number}.", color=discord.Color.yellow()))
-        voters.add(ctx.author.id)
-
-        if len(voters) >= required_votes:
+        if status == self.VOTE_PASSED:
             removed_song = guild_queue.pop(number - 1)
             await self.save_queue_to_db(ctx.guild.id)
             self.remove_votes.pop(ctx.guild.id, None)
             await ctx.send(embed=discord.Embed(description=f"🗳️ Vote passed! Removed **{removed_song.title}** from the queue.", color=discord.Color.green()))
         else:
-            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to remove song #{number} added. **{len(voters)}/{required_votes}** votes now.", color=discord.Color.blue()))
+            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to remove song #{number} added. **{votes}/{required_votes}** votes now.", color=discord.Color.blue()))
 
-    @commands.command(name='clear')
+    @commands.hybrid_command(name='clear')
     async def clear(self, ctx):
         """Clears all songs from the queue, via a vote."""
         guild_queue = self.queues.get(ctx.guild.id)
@@ -1029,21 +1698,18 @@ class Music(commands.Cog):
             await self.save_queue_to_db(ctx.guild.id)
             return await ctx.send(embed=discord.Embed(description="✅ Queue force-cleared by an admin.", color=discord.Color.green()))
 
-        listeners = [member for member in vc.channel.members if not member.bot]
-        required_votes = (len(listeners) // 2) + 1
         voters = self.clear_votes.setdefault(ctx.guild.id, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, ctx.author.id)
 
-        if ctx.author.id in voters:
+        if status == self.VOTE_ALREADY:
             return await ctx.send(embed=discord.Embed(description="ℹ️ You have already voted to clear the queue.", color=discord.Color.yellow()))
-        voters.add(ctx.author.id)
-
-        if len(voters) >= required_votes:
+        if status == self.VOTE_PASSED:
             guild_queue.clear()
             await self.save_queue_to_db(ctx.guild.id)
             self.clear_votes.pop(ctx.guild.id, None)
-            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote passed! ({len(voters)}/{required_votes}). The queue has been cleared.", color=discord.Color.green()))
+            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote passed! ({votes}/{required_votes}). The queue has been cleared.", color=discord.Color.green()))
         else:
-            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to clear added. **{len(voters)}/{required_votes}** votes now, need **{required_votes}** to pass.", color=discord.Color.blue()))
+            await ctx.send(embed=discord.Embed(description=f"🗳️ Vote to clear added. **{votes}/{required_votes}** votes now, need **{required_votes}** to pass.", color=discord.Color.blue()))
 
     # --- Reusable Command Logic with Voting ---
 
@@ -1062,6 +1728,8 @@ class Music(commands.Cog):
         # The core stopping logic is now merged here for consistency.
         self.queues[guild.id] = []
         self.loop_states.pop(guild.id, None)
+        # Stop means stop: don't let autoplay resurrect the queue.
+        self.autoplay_enabled.pop(guild.id, None)
         await self.save_queue_to_db(guild.id)
         if vc.is_playing() or vc.is_paused():
             vc.stop()
@@ -1076,26 +1744,23 @@ class Music(commands.Cog):
                                              embed=discord.Embed(description=msg, color=discord.Color.red()))
 
         # --- Voting Logic ---
-        listeners = [member for member in vc.channel.members if not member.bot]
-        required_votes = (len(listeners) // 2) + 1
         voters = self.stop_votes.setdefault(guild.id, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, author.id)
 
-        if author.id in voters:
+        if status == self.VOTE_ALREADY:
             return await self._send_response(context_data,
                                              embed=discord.Embed(description="ℹ️ You have already voted to stop.",
                                                                  color=discord.Color.yellow()), ephemeral=True)
-        voters.add(author.id)
-
-        if len(voters) >= required_votes:
+        if status == self.VOTE_PASSED:
             self.stop_votes.pop(guild.id, None)
-            msg = f"🗳️ Vote passed! ({len(voters)}/{required_votes}). Music has been stopped and queue cleared."
+            msg = f"🗳️ Vote passed! ({votes}/{required_votes}). Music has been stopped and queue cleared."
             await self._send_response(context_data, embed=discord.Embed(description=msg, color=discord.Color.red()))
         else:
-            msg = f"🗳️ Vote to stop added. **{len(voters)}/{required_votes}** votes now."
+            msg = f"🗳️ Vote to stop added. **{votes}/{required_votes}** votes now."
             await self._send_response(context_data, embed=discord.Embed(description=msg, color=discord.Color.blue()),
                                       ephemeral=True)
 
-    @commands.command(name='stop')
+    @commands.hybrid_command(name='stop')
     async def stop(self, ctx):
         """Stops the music, clears the queue, and disconnects, via a vote."""
         await self._stop_logic(ctx)
@@ -1115,26 +1780,23 @@ class Music(commands.Cog):
             self.inactive_since[guild.id] = time.time()
             return await self._send_response(context_data, embed=discord.Embed(description="⏸️ Force-paused the song.", color=discord.Color.orange()), ephemeral=True)
 
-        listeners = [member for member in vc.channel.members if not member.bot]
-        required_votes = (len(listeners) // 2) + 1
         voters = self.pause_votes.setdefault(guild.id, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, author.id)
 
-        if author.id in voters:
+        if status == self.VOTE_ALREADY:
             return await self._send_response(context_data, embed=discord.Embed(description="ℹ️ You have already voted to pause this song.", color=discord.Color.yellow()), ephemeral=True)
 
-        voters.add(author.id)
-
-        if len(voters) >= required_votes:
+        if status == self.VOTE_PASSED:
             vc.pause()
             self.inactive_since[guild.id] = time.time()
             self.pause_votes.pop(guild.id, None)
-            msg = f"🗳️ Vote passed! ({len(voters)}/{required_votes}). Pausing song."
+            msg = f"🗳️ Vote passed! ({votes}/{required_votes}). Pausing song."
             await self._send_response(context_data, embed=discord.Embed(description=msg, color=discord.Color.orange()))
         else:
-            msg = f"🗳️ Vote to pause added. **{len(voters)}/{required_votes}** votes now."
+            msg = f"🗳️ Vote to pause added. **{votes}/{required_votes}** votes now."
             await self._send_response(context_data, embed=discord.Embed(description=msg, color=discord.Color.blue()), ephemeral=True)
 
-    @commands.command(name='pause')
+    @commands.hybrid_command(name='pause')
     async def pause(self, ctx):
         """Pauses the current song, via a vote."""
         await self._pause_logic(ctx)
@@ -1153,27 +1815,147 @@ class Music(commands.Cog):
             vc.stop() # Stopping the player triggers the 'after' callback, which plays the next song.
             return await self._send_response(context_data, embed=discord.Embed(description="⏭️ Force-skipped the song.", color=discord.Color.blue()), ephemeral=True)
 
-        listeners = [member for member in vc.channel.members if not member.bot]
-        required_votes = (len(listeners) // 2) + 1
         voters = self.skip_votes.setdefault(guild.id, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, author.id)
 
-        if author.id in voters:
+        if status == self.VOTE_ALREADY:
             return await self._send_response(context_data, embed=discord.Embed(description="ℹ️ You have already voted to skip this song.", color=discord.Color.yellow()), ephemeral=True)
 
-        voters.add(author.id)
-
-        if len(voters) >= required_votes:
+        if status == self.VOTE_PASSED:
             vc.stop()
-            msg = f"🗳️ Vote passed! ({len(voters)}/{required_votes}). Skipping song."
+            msg = f"🗳️ Vote passed! ({votes}/{required_votes}). Skipping song."
             await self._send_response(context_data, embed=discord.Embed(description=msg, color=discord.Color.green()))
         else:
-            msg = f"🗳️ Vote to skip added. **{len(voters)}/{required_votes}** votes now."
+            msg = f"🗳️ Vote to skip added. **{votes}/{required_votes}** votes now."
             await self._send_response(context_data, embed=discord.Embed(description=msg, color=discord.Color.blue()), ephemeral=True)
 
-    @commands.command(name='skip', aliases=['s'])
+    @commands.hybrid_command(name='skip', aliases=['s'])
     async def skip(self, ctx):
         """Skips the current song, via a vote."""
         await self._skip_logic(ctx)
+
+    # --- Web dashboard integration ---
+    # These methods let the optional web "now playing" screen read state and,
+    # when enabled, drive playback. Permission mirrors the bot: an admin, or a
+    # user currently in the bot's voice channel, may control.
+    def web_snapshot(self, guild) -> dict:
+        """A JSON-serializable snapshot of the guild's player for the web UI."""
+        gid = guild.id
+        vc = guild.voice_client
+        playing = bool(vc and vc.is_playing())
+        paused = bool(vc and vc.is_paused())
+
+        now = None
+        song = self.current_song.get(gid)
+        if song and (playing or paused):
+            start = self.song_start_times.get(gid)
+            elapsed = 0
+            if start:
+                elapsed = max(0.0, time.time() - start)
+                if song.duration:
+                    elapsed = min(elapsed, song.duration)
+            now = {
+                "title": song.title,
+                "url": song.url,
+                "thumbnail": song.thumbnail,
+                "uploader": song.uploader,
+                "duration": song.duration,
+                "elapsed": round(elapsed),
+                "requester": getattr(song.requester, "display_name", None),
+            }
+
+        queue = [{
+            "title": s.title, "url": s.url, "thumbnail": s.thumbnail,
+            "duration": s.duration, "uploader": s.uploader,
+        } for s in self.queues.get(gid, [])[:25]]
+
+        return {
+            "connected": bool(vc and vc.is_connected()),
+            "playing": playing,
+            "paused": paused,
+            "now": now,
+            "queue": queue,
+            "queue_length": len(self.queues.get(gid, [])),
+            "volume": self.guild_volumes.get(gid, 50),
+            "loop": self.loop_states.get(gid, "off"),
+        }
+
+    def web_can_control(self, guild, member) -> bool:
+        """Whether a member may control playback from the web (admin or in-channel)."""
+        vc = guild.voice_client
+        if not vc or not vc.is_connected() or member is None:
+            return False
+        if member.guild_permissions.administrator:
+            return True
+        return bool(member.voice and member.voice.channel == vc.channel)
+
+    async def web_control(self, guild, member, action: str, value=None) -> dict:
+        """Applies a control action from the web UI, after checking permission."""
+        if not self.web_can_control(guild, member):
+            return {"ok": False, "error": "You must be an admin or in the bot's voice channel."}
+
+        gid = guild.id
+        vc = guild.voice_client
+        if action == "pause":
+            if vc.is_playing():
+                vc.pause()
+                self.inactive_since[gid] = time.time()
+        elif action == "resume":
+            if vc.is_paused():
+                vc.resume()
+                self.inactive_since.pop(gid, None)
+                self.pause_votes.pop(gid, None)
+        elif action == "skip":
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+        elif action == "stop":
+            await self._web_stop(guild)
+        elif action == "previous":
+            if not await self._web_previous(guild):
+                return {"ok": False, "error": "There's no previous song."}
+        elif action == "volume":
+            try:
+                v = max(0, min(200, int(value)))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "Invalid volume."}
+            self.guild_volumes[gid] = v
+            if vc.source:
+                vc.source.volume = v / 100
+            await self.save_volume_to_db(gid, v)
+        else:
+            return {"ok": False, "error": "Unknown action."}
+        return {"ok": True}
+
+    async def _web_stop(self, guild):
+        """Stops playback and clears the queue (no vote, no chat response)."""
+        gid = guild.id
+        self.queues[gid] = []
+        self.loop_states.pop(gid, None)
+        self.autoplay_enabled.pop(gid, None)
+        await self.save_queue_to_db(gid)
+        vc = guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        await self._cleanup_player_message(gid)
+        await self.bot.change_presence(
+            activity=discord.Activity(type=discord.ActivityType.listening, name=f"{self.bot.command_prefix}play"))
+        self.inactive_since[gid] = time.time()
+
+    async def _web_previous(self, guild) -> bool:
+        """Requeues the previous song. Mirrors the ⏮️ player button."""
+        gid = guild.id
+        history = self.song_history.get(gid)
+        if not history or len(history) < 2:
+            return False
+        current_song = history.pop()
+        previous_song = history.pop()
+        queue = self.queues.setdefault(gid, [])
+        queue.insert(0, current_song)
+        queue.insert(0, previous_song)
+        vc = guild.voice_client
+        if vc:
+            vc.stop()
+        return True
 
 
 async def setup(bot):

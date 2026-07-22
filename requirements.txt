@@ -1,0 +1,12 @@
+discord.py[voice]>=2.3,<3
+yt-dlp[default]
+# yt-dlp plugin that fetches PO tokens from the bgutil provider sidecar, keeping
+# YouTube playback working headlessly without cookies (see docker-compose.yml).
+bgutil-ytdlp-pot-provider
+python-dotenv>=1.0
+spotipy>=2.23
+aiosqlite>=0.19
+aiofiles>=23.0
+PyNaCl>=1.5
+# Web dashboard (optional, WEB_ENABLED=1). aiohttp also ships with discord.py.
+aiohttp>=3.9

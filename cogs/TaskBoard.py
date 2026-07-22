@@ -19,6 +19,7 @@ Key Features:
 import asyncio
 import json
 import datetime
+import os
 from typing import List, Optional, Dict
 
 import aiofiles
@@ -43,12 +44,16 @@ class Task:
         due_date (datetime.datetime): The date the task is due.
         finished (Optional[str]): A timestamp if the task is done, otherwise None.
     """
-    def __init__(self, user_id: int, task: str, due_date: datetime.datetime, finished: Optional[str] = None):
+    def __init__(self, user_id: int, task: str, due_date: datetime.datetime, finished: Optional[str] = None,
+                 reminded: bool = False):
         self.user_id: int = user_id
         self.task: str = task
         self.due_date: datetime.datetime = due_date
         # finished is None for incomplete tasks, making it easy to check the status.
         self.finished: Optional[str] = finished
+        # True once a "due tomorrow" reminder DM has been sent, so the periodic
+        # reminder loop doesn't message the user again every time it runs.
+        self.reminded: bool = reminded
 
     def mark_done(self):
         """Marks the task as done by setting the current timestamp."""
@@ -57,6 +62,8 @@ class Task:
     def mark_undone(self):
         """Marks the task as not done by resetting the finished timestamp."""
         self.finished = None
+        # Allow a fresh reminder if the task is re-opened.
+        self.reminded = False
 
     @property
     def is_finished(self) -> bool:
@@ -74,7 +81,8 @@ class Task:
             'user_id': self.user_id,
             'task': self.task,
             'due_date': self.due_date.strftime('%Y-%m-%d'),
-            'finished': self.finished
+            'finished': self.finished,
+            'reminded': self.reminded
         }
 
     @classmethod
@@ -86,7 +94,7 @@ class Task:
         reading the data from the JSON file.
         """
         due_date = datetime.datetime.strptime(data['due_date'], '%Y-%m-%d')
-        return cls(data['user_id'], data['task'], due_date, data.get('finished'))
+        return cls(data['user_id'], data['task'], due_date, data.get('finished'), data.get('reminded', False))
 
 
 # --- File Management ---
@@ -154,7 +162,8 @@ class TaskBoard(commands.Cog):
     """
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.file_manager = FileManager()
+        # DATA_DIR points at the persistent volume on Docker/Coolify deployments.
+        self.file_manager = FileManager(os.path.join(os.getenv("DATA_DIR", "."), "tasks.json"))
         # The main in-memory data structure for storing tasks.
         # Format: {guild_id: {user_id: [Task, ...]}}
         self.tasks: Dict[int, Dict[int, List[Task]]] = {}
@@ -185,22 +194,31 @@ class TaskBoard(commands.Cog):
         """
         now = datetime.datetime.now()
         one_day_later = now + datetime.timedelta(days=1)
+        dirty = False
 
         # Iterate through all guilds, then all users within each guild.
         for guild_id, user_task_map in self.tasks.items():
             for user_id, user_tasks in user_task_map.items():
                 for task in user_tasks:
-                    # Check if the task is unfinished and due within the next 24 hours.
-                    if not task.is_finished and now < task.due_date < one_day_later:
+                    # Check if the task is unfinished, due within the next 24 hours,
+                    # and hasn't already had a reminder sent.
+                    if not task.is_finished and not task.reminded and now < task.due_date < one_day_later:
                         user = self.bot.get_user(user_id)
                         guild = self.bot.get_guild(guild_id)
                         if user and guild:
                             try:
                                 await user.send(
                                     f"👋 Reminder from server **{guild.name}**: Your task **'{task.task}'** is due tomorrow!")
+                                # Mark as reminded so we don't DM again on the next loop.
+                                task.reminded = True
+                                dirty = True
                             # This handles cases where the user has blocked the bot or disabled DMs.
                             except discord.Forbidden:
                                 print(f"Could not send reminder to user {user_id}.")
+
+        # Persist the reminded flags so they survive a restart.
+        if dirty:
+            await self.file_manager.save_tasks(self.tasks)
 
     @check_reminders.before_loop
     async def before_check_reminders(self):
@@ -209,7 +227,7 @@ class TaskBoard(commands.Cog):
 
     # --- Commands ---
 
-    @commands.command(name='addtask')
+    @commands.hybrid_command(name='addtask')
     @commands.guild_only()
     async def add_task(self, ctx: commands.Context, member: discord.Member, due_date_str: str, *, description: str):
         """Adds a new task for a user on this server. Date format: YYYY-MM-DD."""
@@ -228,7 +246,7 @@ class TaskBoard(commands.Cog):
         await self.file_manager.save_tasks(self.tasks)
         await ctx.send(f"✅ Task added for {member.mention}: **{description}**")
 
-    @commands.command(name='showtasks')
+    @commands.hybrid_command(name='showtasks')
     @commands.guild_only()
     async def show_tasks(self, ctx: commands.Context, member: Optional[discord.Member]):
         """Shows your tasks or the tasks of a specified member on this server."""
@@ -255,7 +273,7 @@ class TaskBoard(commands.Cog):
             )
         await ctx.send(embed=embed)
 
-    @commands.command(name='showalltasks')
+    @commands.hybrid_command(name='showalltasks')
     @commands.has_permissions(manage_guild=True)
     @commands.guild_only()
     async def show_all_tasks(self, ctx: commands.Context):

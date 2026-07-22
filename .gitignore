@@ -176,3 +176,9 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/python
 
 *.db
+
+# Bot runtime data
+cookies.txt
+tasks.json
+.yt-dlp-cache/
+data/
