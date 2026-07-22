@@ -27,9 +27,9 @@ services:
     volumes:
       # Persists music_queue.db, tasks.json and cookies.txt across redeploys.
       - lambda-data:/data
-    # Exposes the web dashboard. Harmless when the dashboard is disabled.
-    ports:
-      - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
+    # No host port binding: on Coolify the proxy routes the domain to the
+    # container's exposed port (8080). Publishing to the host conflicts with
+    # Coolify's own services. For plain `docker compose`, add a `ports:` mapping.
 
   # Generates YouTube PO tokens for yt-dlp (bgutil-ytdlp-pot-provider plugin).
   bgutil-provider:
