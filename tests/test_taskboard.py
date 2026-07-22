@@ -149,6 +149,12 @@ async def test_check_reminders_sends_dm(cog, mock_context):
     assert "Urgent Task" in sent_message
     assert "Test Server" in sent_message
 
+    # The task should now be flagged as reminded, and a second run of the loop
+    # must NOT send another DM (regression test for reminder spam).
+    assert task_to_remind.reminded is True
+    await cog.check_reminders.coro(cog)
+    mock_user.send.assert_awaited_once()
+
 
 async def test_file_manager_save_and_load(tmp_path):
     """
