@@ -19,7 +19,7 @@ class PlayerControls(discord.ui.View):
     Built with `timeout=None` so the buttons keep working even after the bot
     restarts (the cog re-registers this view on load).
     """
-    def __init__(self, music_cog, player):
+    def __init__(self, music_cog, player, player_url: str = None):
         super().__init__(timeout=None)
         self.cog = music_cog
 
@@ -33,6 +33,12 @@ class PlayerControls(discord.ui.View):
                 label="Lyrics", emoji="📜", style=discord.ButtonStyle.link, url=lyrics_url
             )
             self.add_item(lyrics_button)
+
+        # Link to the live web player when the dashboard is running.
+        if player_url:
+            self.add_item(discord.ui.Button(
+                label="Live Player", emoji="🎧", style=discord.ButtonStyle.link, url=player_url
+            ))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """

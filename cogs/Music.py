@@ -225,6 +225,16 @@ class Music(commands.Cog):
         song.uploader = resolved.uploader or song.uploader
         return True
 
+    def _player_url(self, guild_id: int) -> Union[str, None]:
+        """
+        The public now-playing page for this guild, or None when the optional web
+        dashboard isn't running. Used to add a "Live Player" link to the player.
+        """
+        web = self.bot.get_cog("WebServer")
+        if web and getattr(web, "_runner", None) and getattr(web, "base_url", None):
+            return f"{web.base_url.rstrip('/')}/np/{guild_id}"
+        return None
+
     async def _prefetch_next(self, guild_id: int):
         """
         Resolves the upcoming song while the current one plays, so the transition
@@ -719,7 +729,7 @@ class Music(commands.Cog):
                 embed.add_field(name="Duration", value=f"{duration_min}:{duration_sec:02d}", inline=True)
             embed.set_footer(text=f"Requested by {player.requester.display_name}", icon_url=player.requester.display_avatar.url)
 
-            controls = PlayerControls(self, player)
+            controls = PlayerControls(self, player, player_url=self._player_url(guild_id))
             now_playing_message = await ctx.send(embed=embed, view=controls)
             self.now_playing_messages[guild_id] = now_playing_message
 
