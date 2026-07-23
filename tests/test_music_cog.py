@@ -197,7 +197,8 @@ async def test_stop_command(music_cog, mock_ctx):
 
     assert not music_cog.queues.get(mock_ctx.guild.id)
     mock_vc.stop.assert_called_once()
-    mock_ctx.channel.send.assert_awaited_once()
+    # Responses go through ctx.send so 'ephemeral' is handled correctly.
+    mock_ctx.send.assert_awaited_once()
 
 # --- Lazy Playlist Resolution Tests ---
 
@@ -400,6 +401,38 @@ async def test_play_next_clears_session_when_queue_empty(music_cog, mock_ctx):
     await music_cog.play_next(mock_ctx)
 
     music_cog.clear_session.assert_awaited_once_with(mock_ctx.guild.id)
+
+
+@pytest.mark.asyncio
+async def test_skip_with_nothing_playing_does_not_crash(music_cog, mock_ctx):
+    """
+    Prefix commands must not pass 'ephemeral' to a raw channel send.
+
+    Regression: Messageable.send() rejects ephemeral, so !skip raised a TypeError
+    instead of replying.
+    """
+    mock_vc = MagicMock()
+    mock_vc.source = None
+    mock_ctx.guild.voice_client = mock_vc
+
+    await music_cog.skip.callback(music_cog, mock_ctx)
+
+    # Replied through ctx.send (which tolerates ephemeral), not channel.send.
+    mock_ctx.send.assert_awaited_once()
+    embed = mock_ctx.send.call_args.kwargs['embed']
+    assert "Nothing to skip" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_send_response_strips_ephemeral_without_a_context(music_cog):
+    """The raw-channel fallback (e.g. resume contexts) must drop 'ephemeral'."""
+    channel = AsyncMock()
+    context_data = {"is_interaction": False, "ctx": None, "interaction": None,
+                    "channel": channel}
+
+    await music_cog._send_response(context_data, content="hi", ephemeral=True)
+
+    assert "ephemeral" not in channel.send.call_args.kwargs
 
 
 # --- Web Player Tests ---
