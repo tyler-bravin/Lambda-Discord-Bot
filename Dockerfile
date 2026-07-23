@@ -9,6 +9,13 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DATA_DIR=/data
 
+# discord.py encodes voice audio with libopus, which is a separate shared library
+# from the ffmpeg binaries below (ffmpeg decodes the source; libopus encodes what
+# gets sent to Discord). Installing ffmpeg via apt used to pull this in implicitly.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libopus0 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
 
 WORKDIR /app
