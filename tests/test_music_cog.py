@@ -435,6 +435,88 @@ async def test_send_response_strips_ephemeral_without_a_context(music_cog):
     assert "ephemeral" not in channel.send.call_args.kwargs
 
 
+# --- Play Next / Move Tests ---
+
+@pytest.mark.asyncio
+async def test_playnext_inserts_at_front(music_cog, mock_ctx):
+    existing = Song(playlist_entry_1, mock_ctx.author)
+    music_cog.queues[mock_ctx.guild.id] = [existing]
+    mock_ctx.voice_client = MagicMock()
+    mock_ctx.voice_client.is_playing.return_value = True
+    mock_ctx.send.return_value = AsyncMock()
+
+    jumper = Song(full_song_data, mock_ctx.author)
+    with patch.object(music_cog, '_collect_songs', new_callable=AsyncMock) as mock_collect:
+        mock_collect.return_value = ([jumper], False, None)
+        with patch.object(music_cog, 'play_next', new_callable=AsyncMock):
+            await music_cog.playnext.callback(music_cog, mock_ctx, query="a song")
+
+    queue = music_cog.queues[mock_ctx.guild.id]
+    assert queue[0] is jumper and queue[1] is existing
+
+
+@pytest.mark.asyncio
+async def test_playnext_keeps_playlist_order_at_front(music_cog, mock_ctx):
+    existing = Song(playlist_entry_1, mock_ctx.author)
+    music_cog.queues[mock_ctx.guild.id] = [existing]
+    mock_ctx.voice_client = MagicMock()
+    mock_ctx.voice_client.is_playing.return_value = True
+    mock_ctx.send.return_value = AsyncMock()
+
+    first = Song.from_spotify_track({'name': 'A', 'artists': [{'name': 'X'}]}, mock_ctx.author)
+    second = Song.from_spotify_track({'name': 'B', 'artists': [{'name': 'X'}]}, mock_ctx.author)
+    with patch.object(music_cog, '_collect_songs', new_callable=AsyncMock) as mock_collect:
+        mock_collect.return_value = ([first, second], True, None)
+        with patch.object(music_cog, 'play_next', new_callable=AsyncMock):
+            await music_cog.playnext.callback(music_cog, mock_ctx, query="a playlist")
+
+    queue = music_cog.queues[mock_ctx.guild.id]
+    assert [queue[0], queue[1], queue[2]] == [first, second, existing]
+
+
+@pytest.mark.asyncio
+async def test_move_reorders_queue_for_requester(music_cog, mock_ctx):
+    mock_ctx.author.id = 4242
+    mock_ctx.author.guild_permissions.administrator = False
+    songs = []
+    for title in ("one", "two", "three"):
+        song = Song({**full_song_data, 'title': title}, mock_ctx.author)
+        song.requester_id = 4242
+        songs.append(song)
+    music_cog.queues[mock_ctx.guild.id] = songs
+
+    await music_cog.move.callback(music_cog, mock_ctx, position=3, destination=1)
+
+    assert [s.title for s in music_cog.queues[mock_ctx.guild.id]] == ["three", "one", "two"]
+    music_cog.save_queue_to_db.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_move_rejects_other_peoples_songs(music_cog, mock_ctx):
+    mock_ctx.author.id = 1
+    mock_ctx.author.guild_permissions.administrator = False
+    songs = [Song(full_song_data, mock_ctx.author) for _ in range(2)]
+    for song in songs:
+        song.requester_id = 999  # queued by someone else
+    music_cog.queues[mock_ctx.guild.id] = list(songs)
+
+    await music_cog.move.callback(music_cog, mock_ctx, position=1, destination=2)
+
+    assert music_cog.queues[mock_ctx.guild.id] == songs  # untouched
+    embed = mock_ctx.send.call_args.kwargs['embed']
+    assert "admin or the person who queued" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_move_rejects_out_of_range(music_cog, mock_ctx):
+    music_cog.queues[mock_ctx.guild.id] = [Song(full_song_data, mock_ctx.author) for _ in range(2)]
+
+    await music_cog.move.callback(music_cog, mock_ctx, position=1, destination=99)
+
+    embed = mock_ctx.send.call_args.kwargs['embed']
+    assert "Invalid position" in embed.description
+
+
 # --- Web Player Tests ---
 
 def _guild_with_vc(playing=True):
