@@ -9,7 +9,7 @@ A comprehensive, multi-purpose Discord bot built with `discord.py`. It features 
 ## ✨ Key Features
 
 ### 🎵 Music System
-- **Wide Source Support**: Play music from YouTube and Spotify (tracks, playlists, and albums).
+- **Wide Source Support**: YouTube and SoundCloud (tracks, playlists and sets), plus Spotify (tracks, playlists, albums) and Apple Music (songs, albums).
 - **Persistent Queue**: The music queue is saved to a database, so it survives bot restarts.
 - **Interactive Controls**: A modern UI with buttons for play/pause, skip, stop, previous, and lyrics.
 - **Democratic Controls**: A vote-based system for skipping, stopping, and other actions ensures fair use.
@@ -157,7 +157,7 @@ Most commands work both as prefix commands (`!play`) **and** as slash commands (
 ### Music Commands
 | Command | Aliases | Slash | Description |
 |---|---|---|---|
-| `!play <song>` | `!p` | ✅ | Plays a song, URL, or Spotify/YouTube playlist. |
+| `!play <song>` | `!p` | ✅ | Plays a search, URL, or playlist (see [Supported sources](#supported-sources)). |
 | `!pause` | | ✅ | Pauses the current song (requires votes). |
 | `!stop` | | ✅ | Stops the music and clears the queue (requires votes). |
 | `!skip` | `!s` | ✅ | Skips the current song (requires votes). |
@@ -191,6 +191,20 @@ Most commands work both as prefix commands (`!play`) **and** as slash commands (
 | `!reload` | — | **(Bot Owner Only)** Reloads all cogs. |
 | `!ytdlp` | — | **(Bot Owner Only)** Forces an immediate yt-dlp update check. |
 | `!sync` | — | **(Bot Owner Only)** Re-syncs slash commands with Discord. |
+
+### Supported sources
+| Source | What works | How |
+|---|---|---|
+| **YouTube** | Videos, playlists, searches | Streamed directly |
+| **SoundCloud** | Tracks and sets | Streamed directly |
+| **Spotify** | Tracks, albums, **public** playlists | Metadata → plays the matching YouTube video |
+| **Apple Music** | Songs and albums | Metadata → plays the matching YouTube video |
+
+Spotify and Apple Music are **DRM-protected**, so their audio can never be streamed by any bot. Lambda reads the track details and plays the matching YouTube video instead — which is why those tracks queue instantly and resolve as they play.
+
+Two limits worth knowing:
+- **Spotify playlists must be public.** Private and collaborative playlists are invisible to the API, as are Spotify-generated ones (Discover Weekly, Daily Mix, Liked Songs).
+- **Apple Music playlists aren't supported** — they require Apple's paid developer API. Songs and albums work via the free iTunes lookup, no credentials needed.
 
 ### Slash commands
 Slash commands are registered automatically the first time the bot starts. Notes:
