@@ -492,6 +492,32 @@ async def test_lyrics_button_creation():
     assert "genius.com" in lyrics_button.url
     assert "Bohemian+Rhapsody+Queen" in lyrics_button.url
 
+def test_live_player_button_added_when_web_running(mock_player):
+    controls = PlayerControls(MagicMock(), mock_player, player_url="https://x.dev/np/1")
+    button = next((c for c in controls.children
+                   if isinstance(c, discord.ui.Button) and c.label == "Live Player"), None)
+    assert button is not None
+    assert button.url == "https://x.dev/np/1"
+
+
+def test_live_player_button_absent_without_web(mock_player):
+    controls = PlayerControls(MagicMock(), mock_player)
+    assert not any(getattr(c, "label", None) == "Live Player" for c in controls.children)
+
+
+def test_player_url_none_when_web_disabled(music_cog):
+    music_cog.bot.get_cog.return_value = None
+    assert music_cog._player_url(123) is None
+
+
+def test_player_url_built_from_web_base(music_cog):
+    web = MagicMock()
+    web._runner = object()
+    web.base_url = "https://lambda.example.dev/"
+    music_cog.bot.get_cog.return_value = web
+    assert music_cog._player_url(123) == "https://lambda.example.dev/np/123"
+
+
 @pytest.mark.asyncio
 async def test_queue_command_with_songs(music_cog, mock_ctx, mock_player):
     mock_vc = MagicMock()
