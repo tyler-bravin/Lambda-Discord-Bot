@@ -8,6 +8,7 @@ import discord
 
 # Assuming your music cog is in cogs/Music.py
 from cogs.Music import Music, YTDLSource, Song, PlayerControls, QueuePaginator
+from cogs.sources import Resolution
 
 # --- Test Data ---
 full_song_data = {
@@ -246,30 +247,51 @@ async def test_play_next_resolves_placeholder(mock_from_data, music_cog, mock_ct
 
 
 @pytest.mark.asyncio
-async def test_play_spotify_playlist_queues_placeholders_instantly(music_cog, mock_ctx):
+async def test_play_queues_resolved_playlist_instantly(music_cog, mock_ctx):
+    """A resolved playlist is queued wholesale with no up-front YouTube searches."""
+    mock_ctx.voice_client = None
+    mock_ctx.send.return_value = AsyncMock()
+
+    placeholders = [
+        Song.from_spotify_track(spotify_track_data, mock_ctx.author),
+        Song.from_spotify_track({'name': 'Song 2', 'artists': [{'name': 'Artist 2'}]}, mock_ctx.author),
+    ]
+    resolution = Resolution(songs=placeholders, is_playlist=True)
+
+    with patch('cogs.Music.resolve_query', new_callable=AsyncMock) as mock_resolve:
+        mock_resolve.return_value = resolution
+        with patch.object(music_cog, '_search_and_create_song', new_callable=AsyncMock) as mock_search:
+            with patch.object(music_cog, 'play_next', new_callable=AsyncMock) as mock_play_next:
+                await music_cog.play.callback(
+                    music_cog, mock_ctx, query="https://open.spotify.com/playlist/abc123")
+
+                mock_search.assert_not_awaited()
+                queued = music_cog.queues[mock_ctx.guild.id]
+                assert len(queued) == 2
+                assert all(song.url is None and song.search_query for song in queued)
+                mock_play_next.assert_awaited_once()
+
+    # The whole batch is persisted with a single database write.
+    music_cog.save_queue_to_db.assert_awaited_once_with(mock_ctx.guild.id)
+
+
+@pytest.mark.asyncio
+async def test_play_reports_resolution_error(music_cog, mock_ctx):
+    """A resolver error is surfaced to the user and nothing is queued."""
     mock_ctx.voice_client = None
     message_mock = AsyncMock()
     mock_ctx.send.return_value = message_mock
 
-    music_cog.sp = MagicMock()
-    music_cog.sp.playlist_items.return_value = {
-        'items': [{'track': spotify_track_data}, {'track': {'name': 'Song 2', 'artists': [{'name': 'Artist 2'}]}}],
-        'next': None,
-    }
-
-    with patch.object(music_cog, '_search_and_create_song', new_callable=AsyncMock) as mock_search:
+    with patch('cogs.Music.resolve_query', new_callable=AsyncMock) as mock_resolve:
+        mock_resolve.return_value = Resolution(error="Apple Music playlists aren't supported.")
         with patch.object(music_cog, 'play_next', new_callable=AsyncMock) as mock_play_next:
-            await music_cog.play.callback(music_cog, mock_ctx, query="https://open.spotify.com/playlist/abc123")
+            await music_cog.play.callback(
+                music_cog, mock_ctx, query="https://music.apple.com/gb/playlist/x/pl.123")
 
-            # Every track is queued as a placeholder with NO YouTube searches up front.
-            mock_search.assert_not_awaited()
-            queued = music_cog.queues[mock_ctx.guild.id]
-            assert len(queued) == 2
-            assert all(song.url is None and song.search_query for song in queued)
-            mock_play_next.assert_awaited_once()
-
-    # The whole batch is persisted with a single database write.
-    music_cog.save_queue_to_db.assert_awaited_once_with(mock_ctx.guild.id)
+    embed = message_mock.edit.call_args.kwargs['embed']
+    assert "Apple Music playlists aren't supported." in embed.description
+    assert not music_cog.queues.get(mock_ctx.guild.id)
+    mock_play_next.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -297,40 +319,15 @@ async def test_search_cache_roundtrip(music_cog, tmp_path):
     assert revived.stream_url is None
 
 
-def test_song_from_youtube_entry_builds_placeholder():
+def test_song_from_flat_entry_builds_placeholder():
     requester = MagicMock()
     entry = {'id': 'abc123', 'title': 'A Video', 'duration': 100,
              'channel': 'Some Channel', 'thumbnails': [{'url': 'http://t/1.jpg'}]}
-    song = Song.from_youtube_entry(entry, requester)
+    song = Song.from_flat_entry(entry, requester)
 
     assert song.url == 'https://www.youtube.com/watch?v=abc123'
     assert song.stream_url is None
     assert song.uploader == 'Some Channel'
-
-
-@pytest.mark.asyncio
-async def test_play_youtube_playlist_queues_placeholders(music_cog, mock_ctx):
-    mock_ctx.voice_client = None
-    message_mock = AsyncMock()
-    mock_ctx.send.return_value = message_mock
-
-    placeholders = [
-        Song.from_youtube_entry({'id': 'aaa', 'title': 'First'}, mock_ctx.author),
-        Song.from_youtube_entry({'id': 'bbb', 'title': 'Second'}, mock_ctx.author),
-    ]
-    with patch.object(music_cog, '_youtube_playlist_songs', new_callable=AsyncMock) as mock_yt:
-        mock_yt.return_value = placeholders
-        with patch.object(music_cog, 'play_next', new_callable=AsyncMock) as mock_play_next:
-            await music_cog.play.callback(
-                music_cog, mock_ctx,
-                query="https://www.youtube.com/playlist?list=PL123")
-
-            mock_yt.assert_awaited_once()
-            queued = music_cog.queues[mock_ctx.guild.id]
-            assert len(queued) == 2
-            assert queued[0].url == 'https://www.youtube.com/watch?v=aaa'
-            assert all(s.stream_url is None for s in queued)
-            mock_play_next.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -494,6 +491,32 @@ async def test_lyrics_button_creation():
     assert lyrics_button.style == discord.ButtonStyle.link
     assert "genius.com" in lyrics_button.url
     assert "Bohemian+Rhapsody+Queen" in lyrics_button.url
+
+def test_live_player_button_added_when_web_running(mock_player):
+    controls = PlayerControls(MagicMock(), mock_player, player_url="https://x.dev/np/1")
+    button = next((c for c in controls.children
+                   if isinstance(c, discord.ui.Button) and c.label == "Live Player"), None)
+    assert button is not None
+    assert button.url == "https://x.dev/np/1"
+
+
+def test_live_player_button_absent_without_web(mock_player):
+    controls = PlayerControls(MagicMock(), mock_player)
+    assert not any(getattr(c, "label", None) == "Live Player" for c in controls.children)
+
+
+def test_player_url_none_when_web_disabled(music_cog):
+    music_cog.bot.get_cog.return_value = None
+    assert music_cog._player_url(123) is None
+
+
+def test_player_url_built_from_web_base(music_cog):
+    web = MagicMock()
+    web._runner = object()
+    web.base_url = "https://lambda.example.dev/"
+    music_cog.bot.get_cog.return_value = web
+    assert music_cog._player_url(123) == "https://lambda.example.dev/np/123"
+
 
 @pytest.mark.asyncio
 async def test_queue_command_with_songs(music_cog, mock_ctx, mock_player):

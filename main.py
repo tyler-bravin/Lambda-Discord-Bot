@@ -96,14 +96,22 @@ async def heartbeat():
 
 
 async def load_cogs():
-    """Loads all cogs from the 'cogs' directory."""
+    """
+    Loads every extension in the 'cogs' directory.
+
+    Modules without a ``setup()`` function are shared helpers living alongside
+    the cogs (e.g. sources.py, views.py), not extensions, so they're skipped.
+    """
     for filename in sorted(os.listdir('./cogs')):
-        if filename.endswith('.py'):
-            try:
-                await bot.load_extension(f'cogs.{filename[:-3]}')
-                log.info("Loaded cog: %s", filename)
-            except Exception:
-                log.exception("Failed to load cog %s", filename)
+        if not filename.endswith('.py'):
+            continue
+        try:
+            await bot.load_extension(f'cogs.{filename[:-3]}')
+            log.info("Loaded cog: %s", filename)
+        except commands.NoEntryPointError:
+            log.debug("Skipping %s (helper module, not a cog)", filename)
+        except Exception:
+            log.exception("Failed to load cog %s", filename)
 
 
 async def main():

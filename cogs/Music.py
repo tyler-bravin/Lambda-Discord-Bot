@@ -1,195 +1,53 @@
 # cogs/Music.py
 
 """
-A comprehensive music bot for Discord using discord.py, yt-dlp, and Spotipy.
+The music player: playback, queueing and the vote-based control system.
 
-This bot supports playback from YouTube and Spotify, playlist handling,
-persistent queues via a database, and a vote-based control system for
-moderating player actions like skipping, stopping, and pausing. It features
-interactive UI components built with discord.ui for a modern user experience.
+Where a song *comes from* (YouTube, SoundCloud, Spotify, Apple Music) is handled
+by :mod:`cogs.sources`; the interactive buttons live in :mod:`cogs.views`. This
+module owns the player itself.
 
 Key Features:
-- YouTube and Spotify (tracks, playlists, albums) support.
+- YouTube and SoundCloud streaming, plus Spotify and Apple Music via metadata lookup.
 - Persistent queues and volume settings stored in an SQLite database.
 - Interactive player controls (play/pause, skip, stop, previous) via buttons.
 - Vote-based system for player actions to ensure democratic control.
-- Looping functionality (song or queue).
-- Automatic disconnection when idle or left alone in a channel.
-- A suite of commands for queue management (view, shuffle, remove, clear).
+- Looping, seeking, autoplay and automatic disconnection when idle.
+- Auto-resume of the queue after a restart, and an optional web player.
 """
 
-import discord
-from discord.ext import commands, tasks
-import yt_dlp
 import asyncio
-import aiosqlite
 import json
 import logging
-import math
-import subprocess
-import sys
-import threading
-import traceback
+import os
 import random
 import time
-import spotipy
-import os
-from dotenv import load_dotenv
-from spotipy.oauth2 import SpotifyClientCredentials
+import traceback
+import urllib.parse
 from collections import deque
 from typing import Union
-import urllib.parse
+
+import aiosqlite
+import discord
+import spotipy
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+from spotipy.oauth2 import SpotifyClientCredentials
+
+from cogs.sources import (
+    DATA_DIR,
+    Song,
+    create_ytdl,
+    extract_flat_playlist_blocking,
+    extract_info_blocking,
+    ffmpeg_options,
+    resolve_query,
+    upgrade_ytdlp_blocking,
+)
+from cogs.views import LoopControlsView, PlayerControls, QueuePaginator
 
 log = logging.getLogger(__name__)
 
-# --- Bot Setup: yt-dlp and FFmpeg Configuration ---
-
-# Directory for persistent data (database, cookies, cache). On Docker/Coolify this
-# is set to a mounted volume (e.g. /data) so state survives redeploys.
-DATA_DIR = os.getenv("DATA_DIR", ".")
-
-# Suppress yt-dlp's default bug report message on console errors.
-yt_dlp.utils.bug_reports_message = lambda **kwargs: ''
-
-
-def _find_cookie_file() -> Union[str, None]:
-    """Returns the first existing cookies file, or None if there isn't one."""
-    candidates = [
-        os.getenv("YTDLP_COOKIES"),
-        os.path.join(DATA_DIR, "cookies.txt"),
-        "cookies.txt",
-    ]
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
-
-
-# Configuration for yt-dlp to optimize for audio-only streams.
-ytdl_format_options = {
-    'cachedir': os.path.join(DATA_DIR, '.yt-dlp-cache'),
-    # Prioritizes best audio quality, preferring opus format and streams over 128kbps.
-    'format': 'bestaudio[ext=opus]/bestaudio[abr>128]/bestaudio/best',
-    'extractaudio': True,
-    'audioformat': 'mp3',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    # Ensures only single videos are processed unless a playlist is explicitly requested.
-    'noplaylist': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    # Binds to '0.0.0.0' to mitigate potential IP-related blocking from services like YouTube.
-    'source_address': '0.0.0.0',
-    # Retry transient network/extraction failures instead of failing the request.
-    'retries': 3,
-    'fragment_retries': 10,
-    'extractor_retries': 3,
-    'socket_timeout': 15,
-}
-
-_cookie_file = _find_cookie_file()
-if _cookie_file:
-    ytdl_format_options['cookiefile'] = _cookie_file
-    log.info("Using YouTube cookies from %s", _cookie_file)
-
-# Alternative to a cookies file for non-Docker setups: read cookies straight from
-# a browser profile on the same machine, e.g. "chrome" or "firefox:ProfileName".
-# Inside a container there is no browser, so use the cookies file there instead.
-_cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
-if _cookies_from_browser:
-    browser, _, profile = _cookies_from_browser.partition(':')
-    ytdl_format_options['cookiesfrombrowser'] = (browser, profile or None, None, None)
-    log.info("Reading YouTube cookies from browser: %s", _cookies_from_browser)
-
-# Optional PO token provider (bgutil-ytdlp-pot-provider sidecar). This is what
-# lets YouTube playback keep working headlessly without any cookies for normal
-# videos — it answers YouTube's "confirm you're not a bot" attestation checks.
-_pot_provider_url = os.getenv("POT_PROVIDER_URL")
-if _pot_provider_url:
-    ytdl_format_options['extractor_args'] = {
-        'youtubepot-bgutilhttp': {'base_url': [_pot_provider_url]},
-    }
-    log.info("Using PO token provider at %s", _pot_provider_url)
-
-
-def create_ytdl() -> yt_dlp.YoutubeDL:
-    """Creates a fresh YoutubeDL instance."""
-    return yt_dlp.YoutubeDL(ytdl_format_options)
-
-
-# All extractions go through one shared YoutubeDL instance behind a lock. This
-# serializes yt-dlp (whose instances are not thread-safe) and, crucially, keeps a
-# single cookie jar alive: YouTube *rotates* cookies during use, and saving the
-# jar after every extraction writes the rotated values back to cookies.txt so the
-# file never goes stale and never needs to be re-exported by hand.
-_ytdl_lock = threading.Lock()
-_shared_ytdl: Union[yt_dlp.YoutubeDL, None] = None
-
-
-def extract_info_blocking(query: str, download: bool = False) -> dict:
-    """Thread-safe yt-dlp extraction. Blocking — run in an executor."""
-    global _shared_ytdl
-    with _ytdl_lock:
-        if _shared_ytdl is None:
-            _shared_ytdl = create_ytdl()
-        data = _shared_ytdl.extract_info(query, download=download)
-        _save_cookies(_shared_ytdl)
-        return data
-
-
-def _save_cookies(ydl: yt_dlp.YoutubeDL):
-    """Persists rotated YouTube cookies back to the cookie file, if one is in use."""
-    try:
-        jar = ydl.cookiejar
-        if getattr(jar, 'filename', None):
-            jar.save()
-    except Exception as e:
-        log.debug("Could not save rotated cookies: %s", e)
-
-
-def extract_flat_playlist_blocking(url: str) -> list:
-    """
-    Flat-extracts a playlist's entries (titles + URLs only, no per-video network
-    calls). Blocking — run in an executor. Returns a list of entry dicts.
-    """
-    opts = dict(ytdl_format_options)
-    opts['noplaylist'] = False
-    # 'in_playlist' returns lightweight entries without resolving each video.
-    opts['extract_flat'] = 'in_playlist'
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        data = ydl.extract_info(url, download=False)
-    return data.get('entries') or []
-
-
-def _upgrade_ytdlp_blocking() -> bool:
-    """
-    Upgrades yt-dlp via pip. Blocking — run in an executor.
-
-    Returns True if a new version was actually installed (as opposed to
-    already being up to date or the upgrade failing).
-    """
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir", "yt-dlp"],
-        capture_output=True, text=True, timeout=600,
-    )
-    if result.returncode != 0:
-        log.warning("yt-dlp upgrade failed: %s", result.stderr.strip()[-500:])
-        return False
-    return "Successfully installed" in result.stdout
-
-# Configuration for FFmpeg, the audio processing library.
-ffmpeg_options = {
-    # Arguments passed to FFmpeg before the input, useful for reconnection on stream interruptions.
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    # Core arguments; '-vn' specifies no video processing, which saves resources.
-    'options': '-vn'
-}
-
-# --- Data Structures ---
 
 class ResumeContext:
     """
@@ -207,114 +65,13 @@ class ResumeContext:
         return await self.channel.send(*args, **kwargs)
 
 
-class Song:
-    """
-    A data class representing a song in the queue.
-
-    This class standardizes song information, whether it comes from YouTube or
-    another source. It serves as a structured model for both in-memory queue
-    management and for serialization into the database.
-    """
-    def __init__(self, data, requester):
-        # The full data dictionary from yt-dlp, kept for creating the player source later.
-        self.data = data
-        # Fresh yt-dlp results carry 'webpage_url' (the page) and 'url' (the direct,
-        # expiring stream URL). Dicts restored from the database only have 'url',
-        # which is the *page* URL (see to_dict), so it must not be treated as a stream.
-        if 'webpage_url' in data:
-            self.url = data.get('webpage_url')
-            self.stream_url = data.get('url')
-        else:
-            self.url = data.get('url')
-            self.stream_url = None
-        self.title = data.get('title', 'Unknown Title')
-        self.thumbnail = data.get('thumbnail')
-        self.duration = data.get('duration')
-        self.uploader = data.get('uploader')
-        self.requester = requester
-        self.requester_id = requester.id
-        # Set for unresolved placeholder songs (e.g. Spotify playlist tracks):
-        # the YouTube lookup for this query is deferred until just before playback.
-        self.search_query = data.get('search_query')
-        # When the stream URL was fetched; stream URLs expire after a few hours.
-        self.fetched_at = time.time() if self.stream_url else 0.0
-
-    @classmethod
-    def from_spotify_track(cls, track: dict, requester, album_info: dict = None) -> 'Song':
-        """
-        Creates an unresolved placeholder Song from Spotify track metadata.
-
-        The YouTube search is deferred until just before the song plays (or the
-        prefetcher warms it up), which makes adding large playlists instant.
-        """
-        artists = ", ".join(a['name'] for a in track.get('artists', []) if a.get('name'))
-        if not artists and album_info:
-            artists = ", ".join(a['name'] for a in album_info.get('artists', []) if a.get('name'))
-        images = (track.get('album') or {}).get('images') or (album_info or {}).get('images') or []
-        duration_ms = track.get('duration_ms')
-        data = {
-            'title': f"{track['name']} - {artists}" if artists else track['name'],
-            'uploader': artists or None,
-            'duration': (duration_ms // 1000) if duration_ms else None,
-            'thumbnail': images[0].get('url') if images else None,
-            'search_query': f"{track['name']} {artists}".strip(),
-        }
-        return cls(data, requester)
-
-    @classmethod
-    def from_youtube_entry(cls, entry: dict, requester) -> Union['Song', None]:
-        """
-        Creates a placeholder Song from a flat YouTube playlist entry.
-
-        The entry already carries the video's page URL, so the stream is resolved
-        lazily (like Spotify placeholders) just before playback.
-        """
-        video_id = entry.get('id')
-        webpage_url = entry.get('url')
-        if webpage_url and not webpage_url.startswith('http') and video_id:
-            webpage_url = None  # 'url' was just the bare id; rebuild it below.
-        if not webpage_url:
-            webpage_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
-        if not webpage_url:
-            return None
-        thumbnails = entry.get('thumbnails') or []
-        data = {
-            'webpage_url': webpage_url,
-            'title': entry.get('title', 'Unknown Title'),
-            'duration': entry.get('duration'),
-            'uploader': entry.get('uploader') or entry.get('channel'),
-            'thumbnail': thumbnails[-1].get('url') if thumbnails else None,
-        }
-        return cls(data, requester)
-
-    def to_dict(self):
-        """
-        Serializes the Song object into a dictionary for database storage.
-
-        This method prepares the object for JSON conversion, ensuring only
-        essential, non-expiring metadata is saved. The full 'data' blob and
-        temporary 'stream_url' are excluded.
-        """
-        return {
-            'url': self.url,
-            'title': self.title,
-            'thumbnail': self.thumbnail,
-            'duration': self.duration,
-            'uploader': self.uploader,
-            'requester_id': self.requester_id,
-            # Persisted so unresolved placeholders survive restarts.
-            'search_query': self.search_query
-        }
-
-
 class YTDLSource(discord.PCMVolumeTransformer):
     """
-    Represents an audio source fetched from YouTube or a similar service.
+    A playable audio stream, wrapping FFmpeg with real-time volume control.
 
-    This class wraps the raw audio stream from FFmpeg and is a subclass of
-    `discord.PCMVolumeTransformer`, which allows for real-time volume control.
-    It acts as a factory, using class methods to create instances from either
-    pre-fetched data or a URL.
+    Acts as a factory: build one from pre-fetched yt-dlp data (fast path) or from
+    a URL (re-extracts, used when a stream URL has expired or a placeholder song
+    needs resolving).
     """
     def __init__(self, source, *, data, volume=0.5):
         super().__init__(source, volume)
@@ -338,7 +95,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     async def from_data(cls, data, *, volume=0.5, seek=0):
         """
-        Creates a YTDLSource instance directly from pre-fetched yt-dlp data.
+        Creates a YTDLSource directly from pre-fetched yt-dlp data.
         This is the "fast path" for playback as it avoids blocking network calls.
         """
         filename = data.get('url')
@@ -348,9 +105,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
     async def from_url(cls, url, *, loop=None, stream=False, requester=None, volume=0.5, seek=0):
         """
         Creates a YTDLSource by fetching info from a URL.
-        This is the "slower path" or fallback, used for songs loaded from the
-        database that need their stream URL re-fetched. It runs the blocking
-        `extract_info` call in an executor to avoid stalling the bot's event loop.
+        The blocking `extract_info` call runs in an executor to avoid stalling the
+        bot's event loop.
         """
         loop = loop or asyncio.get_running_loop()
         data = await loop.run_in_executor(None, lambda: extract_info_blocking(url, download=not stream))
@@ -361,225 +117,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
         data['requester'] = requester
         filename = data['url'] if stream else create_ytdl().prepare_filename(data)
         return cls(discord.FFmpegPCMAudio(filename, **cls._ffmpeg_options(seek)), data=data, volume=volume)
-
-
-# --- UI Views for Interactive Controls ---
-
-class PlayerControls(discord.ui.View):
-    """
-    A persistent view attached to the 'Now Playing' message with player controls.
-
-    This view is designed with `timeout=None` to be persistent, meaning it will
-    remain active and functional even after the bot restarts.
-    """
-    def __init__(self, music_cog, player):
-        super().__init__(timeout=None)
-        self.cog = music_cog
-
-        # Dynamically create and add a "Lyrics" button that links to a Genius search.
-        if player and player.title:
-            search_query = f"{player.title} {player.uploader}"
-            encoded_query = urllib.parse.quote_plus(search_query)
-            lyrics_url = f"https://genius.com/search?q={encoded_query}"
-
-            lyrics_button = discord.ui.Button(
-                label="Lyrics", emoji="📜", style=discord.ButtonStyle.link, url=lyrics_url
-            )
-            self.add_item(lyrics_button)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """
-        Validates that the interacting user is in the bot's voice channel.
-        This prevents users outside the current music session from using the controls.
-        """
-        vc = interaction.guild.voice_client
-        if not vc:
-            await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
-            return False
-        if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
-            await interaction.response.send_message("❌ You must be in the voice channel to use this.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(emoji='⏮️', style=discord.ButtonStyle.secondary, custom_id="player_previous")
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Button to play the previously played song."""
-        guild_id = interaction.guild.id
-        history = self.cog.song_history.get(guild_id)
-
-        if not history or len(history) < 2:
-            return await interaction.response.send_message("There is no previous song in the history.", ephemeral=True)
-
-        # Pop the current song (just finished) and then the actual previous song.
-        current_song = history.pop()
-        previous_song = history.pop()
-
-        # Add them back to the front of the main queue in the correct order.
-        queue = self.cog.queues.setdefault(guild_id, [])
-        queue.insert(0, current_song)
-        queue.insert(0, previous_song)
-
-        # Stop the current player (if any) to trigger the 'after' callback.
-        if vc := interaction.guild.voice_client:
-            vc.stop()
-        await interaction.response.send_message("⏪ Playing previous song.", ephemeral=True)
-
-    @discord.ui.button(emoji='⏯️', style=discord.ButtonStyle.secondary, custom_id="player_play_pause")
-    async def play_pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Toggles between playing and pausing the current song."""
-        vc = interaction.guild.voice_client
-        if vc and vc.is_playing():
-            await self.cog._pause_logic(interaction)
-        elif vc and vc.is_paused():
-            # Resuming does not require a vote.
-            vc.resume()
-            self.cog.inactive_since.pop(interaction.guild.id, None)
-            self.cog.pause_votes.pop(interaction.guild.id, None)
-            await interaction.response.send_message("▶️ Resumed.", ephemeral=True)
-
-    @discord.ui.button(emoji='⏹️', style=discord.ButtonStyle.danger, custom_id="player_stop")
-    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Stops playback and clears the queue, subject to a vote."""
-        await self.cog._stop_logic(interaction)
-
-    @discord.ui.button(emoji='⏭️', style=discord.ButtonStyle.secondary, custom_id="player_skip")
-    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Skips the current song, subject to a vote."""
-        await self.cog._skip_logic(interaction)
-
-
-class LoopControlsView(discord.ui.View):
-    """A temporary, user-restricted view for the `!loop` command to select a loop mode."""
-    def __init__(self, music_cog, ctx):
-        super().__init__(timeout=120.0)
-        self.cog = music_cog
-        self.ctx = ctx
-        self.message = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Ensures only the command author can use this interactive menu."""
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("❌ You cannot use this menu.", ephemeral=True)
-            return False
-        # Further checks ensure the user is still in the correct voice channel.
-        vc = interaction.guild.voice_client
-        if not vc or not interaction.user.voice or interaction.user.voice.channel != vc.channel:
-            await interaction.response.send_message("❌ You must be in the voice channel to use this.", ephemeral=True)
-            return False
-        return True
-
-    async def on_timeout(self):
-        """Disables all buttons and updates the message when the view expires."""
-        if self.message:
-            for item in self.children:
-                item.disabled = True
-            await self.message.edit(content="*This loop menu has expired.*", view=self)
-
-    async def _handle_vote(self, interaction: discord.Interaction, mode: str):
-        """Handles the logic for voting on a loop mode."""
-        # Admins can bypass the vote entirely.
-        if interaction.user.guild_permissions.administrator:
-            self.cog.loop_states[interaction.guild.id] = mode
-            for item in self.children: item.disabled = True
-            await self.message.edit(view=self)
-            self.stop()
-            await interaction.response.send_message(f"✅ Loop mode force-set to **{mode}** by an admin.", ephemeral=True)
-            return
-
-        vc = interaction.guild.voice_client
-        guild_votes = self.cog.loop_votes.setdefault(interaction.guild.id, {})
-        voters = guild_votes.setdefault(mode, set())
-        status, votes, required_votes = self.cog._tally_vote(vc, voters, interaction.user.id)
-
-        if status == self.cog.VOTE_ALREADY:
-            await interaction.response.send_message(f"ℹ️ You have already voted to set loop to **{mode}**.", ephemeral=True)
-            return
-
-        # Check if the vote threshold has been met.
-        if status == self.cog.VOTE_PASSED:
-            self.cog.loop_states[interaction.guild.id] = mode
-            self.cog.loop_votes.pop(interaction.guild.id, None)
-            for item in self.children: item.disabled = True
-            await self.message.edit(view=self)
-            self.stop()
-            await interaction.response.send_message(f"🗳️ Vote passed! Loop mode has been set to **{mode}**.")
-        else:
-            await interaction.response.send_message(
-                f"🗳️ Your vote to set loop to **{mode}** was added. Now at **{votes}/{required_votes}** votes.",
-                ephemeral=True)
-
-    @discord.ui.button(label="Loop Song", emoji="🔂", style=discord.ButtonStyle.secondary, custom_id="loop_song")
-    async def loop_song_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle_vote(interaction, 'song')
-
-    @discord.ui.button(label="Loop Queue", emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="loop_queue")
-    async def loop_queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle_vote(interaction, 'queue')
-
-    @discord.ui.button(label="Turn Off", emoji="❌", style=discord.ButtonStyle.danger, custom_id="loop_off")
-    async def loop_off_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle_vote(interaction, 'off')
-
-
-class QueuePaginator(discord.ui.View):
-    """A view for paginating through the song queue with interactive buttons."""
-    QUEUE_SONGS_PER_PAGE = 5
-
-    def __init__(self, queue, now_playing):
-        super().__init__(timeout=120)
-        self.queue = queue
-        self.now_playing = now_playing
-        self.current_page = 0
-        self.songs_per_page = self.QUEUE_SONGS_PER_PAGE
-        self.total_pages = math.ceil(len(self.queue) / self.songs_per_page)
-
-        # Disable navigation buttons if there's only one page or no pages.
-        if self.total_pages <= 1:
-            self.previous_button.disabled = True
-            self.next_button.disabled = True
-
-    async def get_page_embed(self):
-        """Constructs the embed for the current page of the queue."""
-        embed = discord.Embed(title="🎵 Music Queue", color=discord.Color.purple())
-        if self.now_playing:
-            embed.add_field(name="Now Playing", value=f"[{self.now_playing.title}]({self.now_playing.url})", inline=False)
-            if self.now_playing.thumbnail:
-                embed.set_thumbnail(url=self.now_playing.thumbnail)
-        else:
-            embed.add_field(name="Now Playing", value="Nothing is currently playing.", inline=False)
-
-        # Calculate the slice of the queue for the current page.
-        start_index = self.current_page * self.songs_per_page
-        end_index = start_index + self.songs_per_page
-        if self.queue:
-            upcoming_list = ""
-            for i, song in enumerate(self.queue[start_index:end_index], start=start_index):
-                if song.url:
-                    upcoming_list += f"**{i + 1}.** [{discord.utils.escape_markdown(song.title)}]({song.url})\n"
-                else:
-                    upcoming_list += f"**{i + 1}.** {discord.utils.escape_markdown(song.title)}\n"
-            if upcoming_list:
-                embed.add_field(name="Up Next", value=upcoming_list, inline=False)
-
-        footer_text = f"{len(self.queue)} songs in queue"
-        if self.total_pages > 0:
-            footer_text = f"Page {self.current_page + 1}/{self.total_pages} | {footer_text}"
-        embed.set_footer(text=footer_text)
-        return embed
-
-    @discord.ui.button(label='⬅️', style=discord.ButtonStyle.primary)
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Navigates to the previous page of the queue."""
-        self.current_page = (self.current_page - 1 + self.total_pages) % self.total_pages
-        embed = await self.get_page_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label='➡️', style=discord.ButtonStyle.primary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Navigates to the next page of the queue."""
-        self.current_page = (self.current_page + 1) % self.total_pages
-        embed = await self.get_page_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
 
 
 # --- Core Music Cog ---
@@ -688,6 +225,16 @@ class Music(commands.Cog):
         song.uploader = resolved.uploader or song.uploader
         return True
 
+    def _player_url(self, guild_id: int) -> Union[str, None]:
+        """
+        The public now-playing page for this guild, or None when the optional web
+        dashboard isn't running. Used to add a "Live Player" link to the player.
+        """
+        web = self.bot.get_cog("WebServer")
+        if web and getattr(web, "_runner", None) and getattr(web, "base_url", None):
+            return f"{web.base_url.rstrip('/')}/np/{guild_id}"
+        return None
+
     async def _prefetch_next(self, guild_id: int):
         """
         Resolves the upcoming song while the current one plays, so the transition
@@ -745,25 +292,12 @@ class Music(commands.Cog):
                 continue
             if entry.get("id") in recent_ids:
                 continue
-            song = Song.from_youtube_entry(entry, self.bot.user)
+            song = Song.from_flat_entry(entry, self.bot.user)
             if song:
                 self.queues.setdefault(guild_id, []).append(song)
                 await self.save_queue_to_db(guild_id)
                 return True
         return False
-
-    async def _youtube_playlist_songs(self, url: str, requester: discord.Member) -> list:
-        """Flat-extracts a YouTube playlist into a list of placeholder Songs."""
-        loop = self.bot.loop or asyncio.get_running_loop()
-        entries = await loop.run_in_executor(None, lambda: extract_flat_playlist_blocking(url))
-        songs = []
-        for entry in entries:
-            if not entry:
-                continue
-            song = Song.from_youtube_entry(entry, requester)
-            if song:
-                songs.append(song)
-        return songs
 
     @staticmethod
     def _is_url(query: str) -> bool:
@@ -1195,7 +729,7 @@ class Music(commands.Cog):
                 embed.add_field(name="Duration", value=f"{duration_min}:{duration_sec:02d}", inline=True)
             embed.set_footer(text=f"Requested by {player.requester.display_name}", icon_url=player.requester.display_avatar.url)
 
-            controls = PlayerControls(self, player)
+            controls = PlayerControls(self, player, player_url=self._player_url(guild_id))
             now_playing_message = await ctx.send(embed=embed, view=controls)
             self.now_playing_messages[guild_id] = now_playing_message
 
@@ -1278,7 +812,7 @@ class Music(commands.Cog):
         is scheduled for the next moment the bot is idle.
         """
         try:
-            updated = await asyncio.get_running_loop().run_in_executor(None, _upgrade_ytdlp_blocking)
+            updated = await asyncio.get_running_loop().run_in_executor(None, upgrade_ytdlp_blocking)
         except Exception:
             log.exception("yt-dlp update check failed")
             return
@@ -1322,88 +856,34 @@ class Music(commands.Cog):
 
         processing_embed = await ctx.send(embed=discord.Embed(description="🔎 Processing request...", color=discord.Color.yellow()))
 
-        search_queries = []
-        placeholder_songs = []
-        is_playlist = False
-        try:
-            # A more robust check for spotify links.
-            parsed_url = urllib.parse.urlparse(query)
-            is_spotify_link = "spotify.com" in parsed_url.netloc
-            # Treat a link as a YouTube playlist only when it's a pure playlist URL
-            # (has 'list' but no 'v'); a normal 'watch?v=…&list=…' plays the single
-            # video, which also avoids expanding autogenerated radio/mix lists.
-            query_params = urllib.parse.parse_qs(parsed_url.query)
-            is_youtube = any(h in parsed_url.netloc for h in ("youtube.com", "youtu.be"))
-            is_youtube_playlist = is_youtube and "list" in query_params and "v" not in query_params
-        except Exception:
-            is_spotify_link = False
-            is_youtube_playlist = False
+        # Work out what the query actually is (Spotify/Apple/SoundCloud/YouTube
+        # link, playlist, or plain search) and get back songs or a search term.
+        resolution = await resolve_query(query, ctx.author, spotify=self.sp, loop=self.bot.loop)
 
-        # Spotify link processing logic
-        if is_spotify_link and self.sp:
-            await processing_embed.edit(embed=discord.Embed(description="🎶 Found a Spotify link, getting info...", color=discord.Color.green()))
-            try:
-                if "track" in query:
-                    track = self.sp.track(query)
-                    artist_names = ", ".join([artist['name'] for artist in track['artists']])
-                    search_queries.append(f"{track['name']} {artist_names}")
-                elif "playlist" in query or "album" in query:
-                    is_playlist = True
-                    items = []
-                    if "playlist" in query:
-                        results = self.sp.playlist_items(query, limit=100)
-                        items.extend(results['items'])
-                        while results['next']:
-                            results = self.sp.next(results)
-                            items.extend(results['items'])
-                    else:  # album
-                        results = self.sp.album_tracks(query, limit=50)
-                        items.extend(results['items'])
-                        while results['next']:
-                            results = self.sp.next(results)
-                            items.extend(results['items'])
-
-                    album_info = self.sp.album(query) if "album" in query else None
-                    for item in items:
-                        track = item if "album" in query else item.get('track')
-                        if track and track.get('name'):
-                            # Queued as unresolved placeholders; the YouTube search
-                            # happens lazily just before each track plays.
-                            placeholder_songs.append(Song.from_spotify_track(track, ctx.author, album_info))
-            except Exception:
-                traceback.print_exc()
-                return await processing_embed.edit(embed=discord.Embed(title="❌ Spotify Error", description="Could not process the Spotify link. It may be invalid or private.", color=discord.Color.red()))
-        # YouTube playlist processing logic
-        elif is_youtube_playlist:
-            await processing_embed.edit(embed=discord.Embed(description="🎶 Found a YouTube playlist, getting info...", color=discord.Color.green()))
-            try:
-                placeholder_songs = await self._youtube_playlist_songs(query, ctx.author)
-                is_playlist = True
-            except Exception:
-                traceback.print_exc()
-                return await processing_embed.edit(embed=discord.Embed(title="❌ YouTube Error", description="Could not process the YouTube playlist. It may be private or unavailable.", color=discord.Color.red()))
-        else:
-            search_queries.append(query)
-
-        if not search_queries and not placeholder_songs:
-            return await processing_embed.edit(embed=discord.Embed(title="❌ Nothing Found", description="Could not find any songs to add from the provided link.", color=discord.Color.red()))
+        if resolution.notice:
+            await processing_embed.edit(embed=discord.Embed(description=resolution.notice, color=discord.Color.green()))
+        if resolution.error:
+            return await processing_embed.edit(embed=discord.Embed(
+                title="❌ Couldn't Add That", description=resolution.error, color=discord.Color.red()))
 
         queue = self.queues.setdefault(ctx.guild.id, [])
 
-        # Playlist handling: all tracks are queued instantly as placeholders and a
-        # single database write covers the whole batch. Tracks that turn out to
-        # have no playable YouTube match are reported (and skipped) at play time.
-        if is_playlist:
-            queue.extend(placeholder_songs)
+        # Playlists queue instantly as placeholders, with a single database write
+        # for the whole batch. Tracks with no playable match are reported (and
+        # skipped) at play time.
+        if resolution.is_playlist:
+            queue.extend(resolution.songs)
             await self.save_queue_to_db(ctx.guild.id)
             await processing_embed.edit(embed=discord.Embed(
-                description=f"✅ Added **{len(placeholder_songs)}** tracks to the queue.",
+                description=f"✅ Added **{len(resolution.songs)}** tracks to the queue.",
                 color=discord.Color.green()))
-        # Single song handling
         else:
-            song = await self._search_and_create_song(search_queries[0], ctx.author)
+            song = await self._search_and_create_song(resolution.query, ctx.author)
             if not song:
-                return await processing_embed.edit(embed=discord.Embed(title="❌ Could Not Find Song", description="Could not find a playable YouTube video for your request.", color=discord.Color.red()))
+                return await processing_embed.edit(embed=discord.Embed(
+                    title="❌ Could Not Find Song",
+                    description="Could not find a playable video for your request.",
+                    color=discord.Color.red()))
 
             queue.append(song)
             await self.save_queue_to_db(ctx.guild.id)

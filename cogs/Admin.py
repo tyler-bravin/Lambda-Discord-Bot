@@ -62,7 +62,7 @@ class Admin(commands.Cog):
     @commands.is_owner()
     async def ytdlp_update(self, ctx: commands.Context):
         """(Bot Owner Only) Forces an immediate yt-dlp update check."""
-        from cogs.Music import _upgrade_ytdlp_blocking
+        from cogs.sources import upgrade_ytdlp_blocking
 
         music_cog = self.bot.get_cog("Music")
         current = yt_dlp.version.__version__
@@ -70,7 +70,7 @@ class Admin(commands.Cog):
             description=f"⏳ Checking for a yt-dlp update (currently `{current}`)…",
             color=discord.Color.yellow()))
 
-        updated = await asyncio.get_running_loop().run_in_executor(None, _upgrade_ytdlp_blocking)
+        updated = await asyncio.get_running_loop().run_in_executor(None, upgrade_ytdlp_blocking)
 
         if updated:
             if music_cog is not None:

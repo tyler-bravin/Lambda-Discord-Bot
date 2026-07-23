@@ -31,6 +31,7 @@ import os
 import re
 import secrets
 import time
+from pathlib import Path
 from urllib.parse import urlencode
 
 import aiohttp
@@ -39,6 +40,15 @@ from aiohttp import web
 from discord.ext import commands
 
 from cogs.TaskBoard import Task
+
+# HTML/CSS lives in cogs/templates so this module stays Python.
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+
+
+def _load_template(name: str) -> str:
+    return (TEMPLATE_DIR / name).read_text(encoding="utf-8")
+
+
 
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
 LRCLIB_UA = "Lambda-Discord-Bot (https://github.com/tyler-bravin/Lambda-Discord-Bot)"
@@ -110,7 +120,9 @@ class WebServer(commands.Cog):
             web.get("/api/np/{guild_id}/lyrics", self.handle_np_lyrics),
             web.post("/api/np/{guild_id}/control", self.handle_np_control),
         ])
-        self._runner = web.AppRunner(app)
+        # access_log=None: the now-playing page polls every couple of seconds per
+        # viewer, which otherwise floods the bot's logs with one line per request.
+        self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
         await site.start()
@@ -389,7 +401,7 @@ class WebServer(commands.Cog):
                             content_type="text/html")
 
     def _render_login(self) -> str:
-        return _PAGE.format(body=(
+        return _render_page((
             '<div class="card center">'
             '<h1>📋 Lambda TaskBoard</h1>'
             '<p>Sign in with Discord to view and manage your tasks.</p>'
@@ -455,7 +467,7 @@ class WebServer(commands.Cog):
 
         header = (f'<div class="topbar"><span>Signed in as <b>{name}</b></span>'
                   f'<a class="btn ghost" href="/logout">Log out</a></div>')
-        return _PAGE.format(body=header + banner + "".join(sections))
+        return _render_page(header + banner + "".join(sections))
 
     def _render_player(self, guild_id: str, guild_name: str) -> str:
         return (_PLAYER_PAGE
@@ -480,306 +492,16 @@ class WebServer(commands.Cog):
             color=discord.Color.blurple()))
 
 
-_PAGE = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lambda TaskBoard</title>
-<style>
-  :root {{
-    color-scheme: dark;
-    --bg: #0e0f13; --card: rgba(255,255,255,.045); --stroke: rgba(255,255,255,.08);
-    --text: #eef0f3; --muted: #a6adbb; --dim: #6b7280;
-    --accent1: #7c5cff; --accent2: #4ea1ff;
-    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{ margin: 0; font-family: var(--font); color: var(--text); padding: 40px 20px 60px;
-          background: radial-gradient(90% 60% at 50% -10%, rgba(90,80,255,.16), transparent 60%), var(--bg);
-          min-height: 100vh; -webkit-font-smoothing: antialiased; }}
-  .topbar {{ max-width: 840px; margin: 0 auto 20px; display: flex; justify-content: space-between;
-             align-items: center; font-size: .92rem; color: var(--muted); }}
-  .card {{ max-width: 840px; margin: 0 auto 20px; background: var(--card); border: 1px solid var(--stroke);
-           border-radius: 20px; padding: 26px 28px; backdrop-filter: blur(20px);
-           box-shadow: 0 20px 50px rgba(0,0,0,.35); animation: rise .45s ease both; }}
-  @keyframes rise {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: none; }} }}
-  .center {{ text-align: center; }}
-  h1 {{ margin: 0 0 8px; font-size: 1.55rem; letter-spacing: -.02em; }}
-  h2 {{ margin: 0 0 16px; font-size: 1.15rem; color: #fff; letter-spacing: -.01em; }}
-  p {{ color: var(--muted); }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ text-align: left; padding: 12px 8px; border-bottom: 1px solid var(--stroke); font-size: .92rem;
-            vertical-align: middle; }}
-  th {{ color: var(--muted); font-weight: 600; font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; }}
-  tr:last-child td {{ border-bottom: none; }}
-  .empty {{ color: var(--muted); text-align: center; padding: 22px 0; }}
-  .done {{ color: #46e5a0; font-weight: 600; }} .todo {{ color: #f0b232; }}
-  .actions {{ white-space: nowrap; text-align: right; }}
-  .inline {{ display: inline; }}
-  .btn {{ display: inline-flex; align-items: center; gap: 6px; color: #fff; border: none; border-radius: 11px;
-          padding: 10px 18px; font-size: .9rem; font-weight: 600; text-decoration: none; cursor: pointer;
-          background: linear-gradient(135deg, var(--accent1), var(--accent2));
-          box-shadow: 0 8px 20px rgba(90,80,255,.32); transition: transform .12s ease, box-shadow .2s ease; }}
-  .btn:hover {{ transform: translateY(-2px); box-shadow: 0 12px 26px rgba(90,80,255,.42); }}
-  .btn:active {{ transform: scale(.97); }}
-  .btn.ghost {{ background: transparent; border: 1px solid var(--stroke); box-shadow: none; color: var(--muted); font-weight: 500; }}
-  .btn.ghost:hover {{ color: #fff; border-color: rgba(255,255,255,.25); box-shadow: none; }}
-  .mini {{ background: rgba(255,255,255,.08); color: #fff; border: 1px solid var(--stroke); border-radius: 8px;
-           padding: 6px 12px; font-size: .8rem; cursor: pointer; margin-left: 6px; transition: background .2s ease; }}
-  .mini:hover {{ background: rgba(255,255,255,.16); }}
-  .mini.danger {{ background: rgba(218,55,60,.18); border-color: rgba(218,55,60,.4); color: #ff9a9d; }}
-  .mini.danger:hover {{ background: rgba(218,55,60,.32); }}
-  .addform {{ display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }}
-  .addform input[type=text] {{ flex: 1; min-width: 180px; }}
-  input {{ background: rgba(0,0,0,.25); border: 1px solid var(--stroke); color: var(--text); border-radius: 11px;
-           padding: 11px 14px; font-size: .9rem; font-family: inherit; transition: border .2s ease; }}
-  input:focus {{ outline: none; border-color: var(--accent2); }}
-  .banner {{ max-width: 840px; margin: 0 auto 18px; background: rgba(218,55,60,.14); border: 1px solid rgba(218,55,60,.4);
-             color: #ffb3b5; border-radius: 12px; padding: 12px 16px; font-size: .9rem; }}
-</style></head>
-<body>{body}</body></html>"""
+_PAGE = _load_template("dashboard.html")
+_PLAYER_PAGE = _load_template("player.html")
 
 
-_PLAYER_PAGE = r"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__GNAME__ — Now Playing</title>
-<style>
-  :root {
-    color-scheme: dark;
-    --glass: rgba(255,255,255,.06);
-    --glass-strong: rgba(255,255,255,.10);
-    --stroke: rgba(255,255,255,.09);
-    --text: #f4f5f7; --muted: #a6adbb; --dim: #6b7280;
-    --accent1: #7c5cff; --accent2: #4ea1ff;
-    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; }
-  body { margin: 0; font-family: var(--font); color: var(--text); background: #0c0d10;
-         overflow-x: hidden; -webkit-font-smoothing: antialiased; }
-  a { color: inherit; }
+def _render_page(body: str) -> str:
+    """Wraps rendered body HTML in the shared dashboard shell."""
+    return _PAGE.replace("__BODY__", body)
 
-  /* Blurred album-art ambience */
-  #bg { position: fixed; inset: -12%; z-index: -2; background-size: cover; background-position: center;
-        filter: blur(70px) saturate(1.5) brightness(.5); transform: scale(1.15);
-        transition: background-image .6s ease, opacity .6s ease; opacity: .9; }
-  #veil { position: fixed; inset: 0; z-index: -1;
-          background: radial-gradient(120% 90% at 50% 0%, transparent 30%, rgba(8,9,12,.55) 75%, rgba(8,9,12,.92) 100%); }
 
-  .wrap { max-width: 1040px; margin: 0 auto; padding: 34px 24px 60px; animation: rise .5s ease both; }
-  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
-  h1 { font-size: .82rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
-       font-weight: 600; margin: 0 0 22px; display: flex; align-items: center; gap: 8px; }
 
-  .grid { display: grid; grid-template-columns: 1.05fr 1fr; gap: 22px; align-items: stretch; }
-  @media (max-width: 780px) { .grid { grid-template-columns: 1fr; } }
-
-  .card { background: var(--glass); border: 1px solid var(--stroke); border-radius: 24px; padding: 26px;
-          backdrop-filter: blur(24px) saturate(1.3); -webkit-backdrop-filter: blur(24px) saturate(1.3);
-          box-shadow: 0 24px 60px rgba(0,0,0,.45); }
-
-  .art-wrap { position: relative; width: 100%; max-width: 300px; margin: 0 auto 22px; aspect-ratio: 1; }
-  #art { width: 100%; height: 100%; object-fit: cover; border-radius: 18px; background: #1b1d22;
-         box-shadow: 0 20px 45px rgba(0,0,0,.5); transition: transform .5s ease, filter .4s ease; }
-  body.paused #art { filter: saturate(.5) brightness(.8); transform: scale(.97); }
-
-  .title { font-size: 1.5rem; font-weight: 750; line-height: 1.2; letter-spacing: -.01em; }
-  .title a { text-decoration: none; }
-  .title a:hover { text-decoration: underline; }
-  .sub { color: var(--muted); font-size: .92rem; margin-top: 5px; }
-  #requester { color: var(--dim); font-size: .8rem; margin-top: 2px; }
-
-  .bar { height: 6px; background: rgba(255,255,255,.12); border-radius: 99px; margin: 22px 0 7px; overflow: hidden; }
-  .fill { height: 100%; width: 0; border-radius: 99px;
-          background: linear-gradient(90deg, var(--accent1), var(--accent2));
-          transition: width .28s linear; }
-  .times { display: flex; justify-content: space-between; font-size: .76rem; color: var(--muted);
-           font-variant-numeric: tabular-nums; }
-
-  .controls { display: flex; align-items: center; gap: 12px; margin-top: 22px; flex-wrap: wrap; }
-  .controls button { display: grid; place-items: center; background: var(--glass-strong);
-                     border: 1px solid var(--stroke); color: #fff; border-radius: 50%;
-                     width: 48px; height: 48px; font-size: 1.05rem; cursor: pointer;
-                     transition: transform .12s ease, background .2s ease; }
-  .controls button:hover { background: rgba(255,255,255,.18); transform: translateY(-2px); }
-  .controls button:active { transform: scale(.92); }
-  .controls button.primary { width: 60px; height: 60px; font-size: 1.35rem; border: none;
-                             background: linear-gradient(135deg, var(--accent1), var(--accent2));
-                             box-shadow: 0 10px 24px rgba(90,80,255,.4); }
-  .vol { flex: 1; min-width: 120px; appearance: none; height: 5px; border-radius: 99px;
-         background: rgba(255,255,255,.14); outline: none; cursor: pointer; }
-  .vol::-webkit-slider-thumb { appearance: none; width: 15px; height: 15px; border-radius: 50%; background: #fff;
-                               box-shadow: 0 2px 6px rgba(0,0,0,.4); }
-  .vol::-moz-range-thumb { width: 15px; height: 15px; border: none; border-radius: 50%; background: #fff; }
-  .hint { color: var(--muted); font-size: .84rem; margin-top: 14px; }
-  .login { display: inline-flex; align-items: center; gap: 8px; margin-top: 14px; padding: 10px 18px;
-           border-radius: 99px; text-decoration: none; font-weight: 600; font-size: .9rem;
-           background: linear-gradient(135deg, var(--accent1), var(--accent2)); color: #fff;
-           box-shadow: 0 10px 24px rgba(90,80,255,.35); transition: transform .12s ease; }
-  .login:hover { transform: translateY(-2px); }
-
-  /* Lyrics */
-  .lyrics { position: relative; height: 100%; min-height: 440px; max-height: 560px; overflow-y: auto;
-            line-height: 1.35; padding: 20px 6px; scrollbar-width: thin;
-            -webkit-mask-image: linear-gradient(transparent, #000 14%, #000 86%, transparent);
-            mask-image: linear-gradient(transparent, #000 14%, #000 86%, transparent); }
-  .lyrics::-webkit-scrollbar { width: 6px; } .lyrics::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 9px; }
-  .lyrics .line { font-size: 1.24rem; font-weight: 650; color: #fff; opacity: .28; padding: 7px 14px;
-                  border-radius: 12px; transition: opacity .35s ease, transform .35s ease, background .35s ease;
-                  transform-origin: left center; }
-  .lyrics .line.active { opacity: 1; transform: scale(1.03); background: rgba(255,255,255,.06); }
-  .lyrics .muted { color: var(--muted); font-size: .95rem; font-weight: 500; opacity: 1; }
-  .lyrics .plain { white-space: pre-wrap; font-size: 1rem; font-weight: 500; opacity: .85; color: #e6e8ec; }
-
-  .queue { margin-top: 30px; }
-  .queue h2 { font-size: .8rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
-  .qrow { display: flex; align-items: center; gap: 14px; padding: 10px 12px; border-radius: 14px;
-          transition: background .2s ease; }
-  .qrow:hover { background: var(--glass); }
-  .qrow img { width: 58px; height: 42px; object-fit: cover; border-radius: 8px; background: #1b1d22; }
-  .qrow .qt { font-size: .92rem; font-weight: 550; }
-  .qrow .qs { font-size: .76rem; color: var(--muted); margin-top: 1px; }
-  .qnum { color: var(--dim); width: 22px; text-align: right; font-size: .8rem; font-variant-numeric: tabular-nums; }
-  .idle { color: var(--muted); padding: 34px 0; text-align: center; font-size: .9rem; }
-</style></head>
-<body>
-  <div id="bg"></div><div id="veil"></div>
-  <div class="wrap">
-  <h1>🎧 __GNAME__</h1>
-  <div class="grid">
-    <div class="card">
-      <div class="art-wrap"><img id="art" alt=""></div>
-      <div id="title" class="title">—</div>
-      <div id="uploader" class="sub"></div>
-      <div class="bar"><div id="fill" class="fill"></div></div>
-      <div class="times"><span id="elapsed">0:00</span><span id="dur">0:00</span></div>
-      <div id="requester"></div>
-      <div id="controls" class="controls"></div>
-      <div id="cmsg" class="hint"></div>
-    </div>
-    <div class="card"><div id="lyrics" class="lyrics"><div class="muted">Lyrics will appear here.</div></div></div>
-  </div>
-  <div class="queue"><h2>Up Next</h2><div id="queue"></div></div>
-</div>
-<script>
-const GID = "__GID__";
-const S = { url:null, duration:0, elapsed:0, syncTs:0, playing:false, paused:false,
-            controls:false, canControl:false, loggedIn:false, csrf:null, lyrics:[] };
-
-function fmt(s){ s=Math.max(0,Math.floor(s||0)); const m=Math.floor(s/60); return m+":"+String(s%60).padStart(2,"0"); }
-
-async function poll(){
-  try{ const r=await fetch(`/api/np/${GID}`); apply(await r.json()); }catch(e){}
-}
-function apply(d){
-  S.controls=d.controls_enabled; S.canControl=d.can_control; S.loggedIn=d.logged_in; S.csrf=d.csrf||null;
-  const now=d.now;
-  if(now){
-    if(now.url!==S.url){ S.url=now.url; loadLyrics(); }
-    S.duration=now.duration||0; S.elapsed=now.elapsed||0; S.syncTs=performance.now();
-    S.playing=d.playing; S.paused=d.paused;
-    document.getElementById("art").src = now.thumbnail||"";
-    document.getElementById("bg").style.backgroundImage = now.thumbnail? `url("${now.thumbnail}")` : "";
-    document.body.classList.toggle("paused", !!d.paused);
-    const t=document.getElementById("title"); t.textContent="";
-    if(now.url){ const a=document.createElement("a"); a.href=now.url; a.target="_blank"; a.rel="noopener"; a.textContent=now.title||"—"; t.appendChild(a); }
-    else { t.textContent=now.title||"—"; }
-    document.getElementById("uploader").textContent=now.uploader||"";
-    document.getElementById("requester").textContent = now.requester? "Requested by "+now.requester : "";
-  } else {
-    S.url=null; S.playing=false; S.paused=false; S.duration=0; S.elapsed=0;
-    document.body.classList.remove("paused");
-    document.getElementById("art").src=""; document.getElementById("bg").style.backgroundImage="";
-    document.getElementById("title").textContent="Nothing playing";
-    document.getElementById("uploader").textContent=""; document.getElementById("requester").textContent="";
-    document.getElementById("lyrics").innerHTML='<div class="muted">Nothing playing right now.</div>';
-    S.lyrics=[];
-  }
-  renderQueue(d.queue||[]);
-  renderControls(d);
-}
-function renderQueue(q){
-  const el=document.getElementById("queue");
-  if(!q.length){ el.innerHTML='<div class="idle">Queue is empty.</div>'; return; }
-  el.innerHTML="";
-  q.forEach((s,i)=>{
-    const row=document.createElement("div"); row.className="qrow";
-    const num=document.createElement("div"); num.className="qnum"; num.textContent=(i+1);
-    const img=document.createElement("img"); img.src=s.thumbnail||""; img.alt="";
-    const box=document.createElement("div");
-    const qt=document.createElement("div"); qt.className="qt"; qt.textContent=s.title||"";
-    const qs=document.createElement("div"); qs.className="qs"; qs.textContent=s.uploader||"";
-    box.appendChild(qt); box.appendChild(qs);
-    row.appendChild(num); row.appendChild(img); row.appendChild(box); el.appendChild(row);
-  });
-}
-function renderControls(d){
-  const bar=document.getElementById("controls"), msg=document.getElementById("cmsg");
-  bar.innerHTML=""; msg.textContent="";
-  if(!S.controls) return;
-  if(!S.loggedIn){
-    const a=document.createElement("a"); a.className="login"; a.href=`/login?next=/np/${GID}`;
-    a.textContent="Login with Discord to control"; bar.appendChild(a); return;
-  }
-  if(!S.canControl){ msg.textContent="Join the bot's voice channel to control playback."; return; }
-  const mk=(label,fn,cls)=>{ const b=document.createElement("button"); b.textContent=label; if(cls)b.className=cls; b.onclick=fn; return b; };
-  bar.appendChild(mk("⏮", ()=>control("previous")));
-  bar.appendChild(mk(S.paused?"▶":"⏸", ()=>control(S.paused?"resume":"pause"), "primary"));
-  bar.appendChild(mk("⏭", ()=>control("skip")));
-  bar.appendChild(mk("⏹", ()=>control("stop")));
-  const vol=document.createElement("input"); vol.type="range"; vol.min=0; vol.max=200; vol.value=d.volume||50;
-  vol.className="vol"; vol.onchange=()=>control("volume", vol.value); bar.appendChild(vol);
-}
-async function control(action, value){
-  if(!S.csrf) return;
-  const body=new URLSearchParams({csrf:S.csrf, action});
-  if(value!==undefined) body.set("value", value);
-  try{ await fetch(`/api/np/${GID}/control`, {method:"POST", body}); }catch(e){}
-  poll();
-}
-async function loadLyrics(){
-  const box=document.getElementById("lyrics");
-  box.innerHTML='<div class="muted">Loading lyrics…</div>'; S.lyrics=[];
-  try{
-    const r=await fetch(`/api/np/${GID}/lyrics`); const d=await r.json();
-    if(d.synced){ S.lyrics=parseLRC(d.synced); renderLyricLines(); }
-    else if(d.plain){ box.innerHTML=""; const p=document.createElement("div"); p.className="plain"; p.textContent=d.plain; box.appendChild(p); }
-    else { box.innerHTML='<div class="muted">No synced lyrics found. <a href="https://genius.com/search?q='+encodeURIComponent(document.getElementById("title").textContent)+'" target="_blank" rel="noopener">Search Genius →</a></div>'; }
-  }catch(e){ box.innerHTML='<div class="muted">Couldn\'t load lyrics.</div>'; }
-}
-function parseLRC(text){
-  const out=[];
-  for(const line of text.split("\n")){
-    const tags=[...line.matchAll(/\[(\d+):(\d+)(?:\.(\d+))?\]/g)];
-    const txt=line.replace(/\[[^\]]*\]/g,"").trim();
-    for(const g of tags){ const t=(+g[1])*60+(+g[2])+(g[3]?+("0."+g[3]):0); out.push({t,txt}); }
-  }
-  return out.sort((a,b)=>a.t-b.t);
-}
-function renderLyricLines(){
-  const box=document.getElementById("lyrics"); box.innerHTML="";
-  S.lyrics.forEach((l,i)=>{ const d=document.createElement("div"); d.className="line"; d.id="ly"+i; d.textContent=l.txt||"♪"; box.appendChild(d); });
-}
-let lastActive=-1;
-function tick(){
-  let e=S.elapsed;
-  if(S.playing && !S.paused && S.syncTs) e+=(performance.now()-S.syncTs)/1000;
-  if(S.duration && e>S.duration) e=S.duration;
-  document.getElementById("fill").style.width = S.duration? Math.min(100,(e/S.duration)*100)+"%":"0";
-  document.getElementById("elapsed").textContent=fmt(e);
-  document.getElementById("dur").textContent=fmt(S.duration);
-  if(S.lyrics.length){
-    let idx=-1; for(let i=0;i<S.lyrics.length;i++){ if(S.lyrics[i].t<=e) idx=i; else break; }
-    if(idx!==lastActive){
-      if(lastActive>=0){ const p=document.getElementById("ly"+lastActive); if(p)p.classList.remove("active"); }
-      const c=document.getElementById("ly"+idx);
-      if(c){ c.classList.add("active"); c.scrollIntoView({block:"center", behavior:"smooth"}); }
-      lastActive=idx;
-    }
-  }
-}
-poll(); setInterval(poll, 2500); setInterval(tick, 250);
-</script></body></html>"""
 
 
 async def setup(bot: commands.Bot):
