@@ -158,6 +158,8 @@ Most commands work both as prefix commands (`!play`) **and** as slash commands (
 | Command | Aliases | Slash | Description |
 |---|---|---|---|
 | `!play <song>` | `!p` | ✅ | Plays a search, URL, or playlist (see [Supported sources](#supported-sources)). |
+| `!playnext <song>` | `!pn` | ✅ | Same as `!play`, but adds to the **front** of the queue. |
+| `!move <from> <to>` | `!mv` | ✅ | Moves a queued song to another position (admin or the requester). |
 | `!pause` | | ✅ | Pauses the current song (requires votes). |
 | `!stop` | | ✅ | Stops the music and clears the queue (requires votes). |
 | `!skip` | `!s` | ✅ | Skips the current song (requires votes). |
