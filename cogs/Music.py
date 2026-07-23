@@ -428,8 +428,17 @@ class Music(commands.Cog):
                 await interaction.response.send_message(*args, **kwargs)
             else:
                 await interaction.followup.send(*args, **kwargs)
-        else:
-            await context_data["channel"].send(*args, **kwargs)
+            return
+
+        ctx = context_data.get("ctx")
+        if ctx is not None:
+            # Context.send honours 'ephemeral' for slash invocations and ignores it
+            # for prefix ones; the raw channel would reject it outright.
+            await ctx.send(*args, **kwargs)
+            return
+
+        kwargs.pop("ephemeral", None)
+        await context_data["channel"].send(*args, **kwargs)
 
     # --- Vote Tallying ---
     # Outcomes returned by _tally_vote.
@@ -594,13 +603,23 @@ class Music(commands.Cog):
         """
         guild_id = ctx.guild.id
 
+        def report(fut):
+            # run_coroutine_threadsafe swallows exceptions unless the future is
+            # inspected. Without this, a failure while advancing the queue makes
+            # the bot go silent with nothing in the logs.
+            try:
+                fut.result()
+            except Exception:
+                log.exception("Failed to advance the queue in guild %s", guild_id)
+
         def after_playback(error):
             if error:
                 log.error("Playback error in guild %s: %s", guild_id, error)
             if guild_id in self.seek_in_progress:
                 self.seek_in_progress.discard(guild_id)
                 return
-            asyncio.run_coroutine_threadsafe(self.on_song_end(ctx, song), self.bot.loop)
+            future = asyncio.run_coroutine_threadsafe(self.on_song_end(ctx, song), self.bot.loop)
+            future.add_done_callback(report)
 
         return after_playback
 
