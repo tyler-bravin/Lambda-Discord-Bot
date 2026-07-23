@@ -225,6 +225,30 @@ class Music(commands.Cog):
         song.uploader = resolved.uploader or song.uploader
         return True
 
+    async def _collect_songs(self, ctx, query: str, status_message=None):
+        """
+        Turns a user's query into songs ready for the queue.
+
+        Returns ``(songs, is_playlist, error)``. Playlist tracks come back as
+        unresolved placeholders (resolved just before they play); a single
+        request is searched immediately so it can be shown with its real title.
+        """
+        resolution = await resolve_query(query, ctx.author, spotify=self.sp, loop=self.bot.loop)
+
+        if resolution.notice and status_message:
+            await status_message.edit(embed=discord.Embed(
+                description=resolution.notice, color=discord.Color.green()))
+        if resolution.error:
+            return None, False, resolution.error
+
+        if resolution.is_playlist:
+            return resolution.songs, True, None
+
+        song = await self._search_and_create_song(resolution.query, ctx.author)
+        if not song:
+            return None, False, "Could not find a playable video for your request."
+        return [song], False, None
+
     def _player_url(self, guild_id: int) -> Union[str, None]:
         """
         The public now-playing page for this guild, or None when the optional web
@@ -875,47 +899,96 @@ class Music(commands.Cog):
 
         processing_embed = await ctx.send(embed=discord.Embed(description="🔎 Processing request...", color=discord.Color.yellow()))
 
-        # Work out what the query actually is (Spotify/Apple/SoundCloud/YouTube
-        # link, playlist, or plain search) and get back songs or a search term.
-        resolution = await resolve_query(query, ctx.author, spotify=self.sp, loop=self.bot.loop)
-
-        if resolution.notice:
-            await processing_embed.edit(embed=discord.Embed(description=resolution.notice, color=discord.Color.green()))
-        if resolution.error:
+        songs, is_playlist, error = await self._collect_songs(ctx, query, processing_embed)
+        if error:
             return await processing_embed.edit(embed=discord.Embed(
-                title="❌ Couldn't Add That", description=resolution.error, color=discord.Color.red()))
+                title="❌ Couldn't Add That", description=error, color=discord.Color.red()))
 
         queue = self.queues.setdefault(ctx.guild.id, [])
+        queue.extend(songs)
+        await self.save_queue_to_db(ctx.guild.id)
 
-        # Playlists queue instantly as placeholders, with a single database write
-        # for the whole batch. Tracks with no playable match are reported (and
-        # skipped) at play time.
-        if resolution.is_playlist:
-            queue.extend(resolution.songs)
-            await self.save_queue_to_db(ctx.guild.id)
+        if is_playlist:
             await processing_embed.edit(embed=discord.Embed(
-                description=f"✅ Added **{len(resolution.songs)}** tracks to the queue.",
+                description=f"✅ Added **{len(songs)}** tracks to the queue.",
                 color=discord.Color.green()))
+        elif was_playing:
+            song = songs[0]
+            await processing_embed.edit(embed=discord.Embed(title="✅ Added to Queue", description=f"Added **[{song.title}]({song.url})** to the queue.", color=discord.Color.green()))
         else:
-            song = await self._search_and_create_song(resolution.query, ctx.author)
-            if not song:
-                return await processing_embed.edit(embed=discord.Embed(
-                    title="❌ Could Not Find Song",
-                    description="Could not find a playable video for your request.",
-                    color=discord.Color.red()))
-
-            queue.append(song)
-            await self.save_queue_to_db(ctx.guild.id)
-
-            if was_playing:
-                await processing_embed.edit(embed=discord.Embed(title="✅ Added to Queue", description=f"Added **[{song.title}]({song.url})** to the queue.", color=discord.Color.green()))
-            else:
-                # If nothing was playing, delete the "Processing..." message as the "Now Playing" will appear.
-                await processing_embed.delete()
+            # If nothing was playing, delete the "Processing..." message as the "Now Playing" will appear.
+            await processing_embed.delete()
 
         # Start playback if the bot wasn't already playing.
         if not was_playing:
             await self.play_next(ctx)
+
+    @commands.hybrid_command(name='playnext', aliases=['pn'])
+    async def playnext(self, ctx, *, query: str):
+        """Adds a song to the front of the queue so it plays next."""
+        if not ctx.author.voice:
+            return await ctx.send(embed=discord.Embed(description="❌ You are not in a voice channel.", color=discord.Color.red()))
+
+        await ctx.defer()
+
+        vc = ctx.voice_client
+        was_playing = vc and (vc.is_playing() or vc.is_paused())
+        if not vc:
+            vc = await ctx.author.voice.channel.connect(self_deaf=True)
+            self.voice_clients[ctx.guild.id] = vc
+
+        status = await ctx.send(embed=discord.Embed(description="🔎 Processing request...", color=discord.Color.yellow()))
+
+        songs, is_playlist, error = await self._collect_songs(ctx, query, status)
+        if error:
+            return await status.edit(embed=discord.Embed(
+                title="❌ Couldn't Add That", description=error, color=discord.Color.red()))
+
+        # Insert at the front, keeping the requested order among themselves.
+        queue = self.queues.setdefault(ctx.guild.id, [])
+        for offset, song in enumerate(songs):
+            queue.insert(offset, song)
+        await self.save_queue_to_db(ctx.guild.id)
+
+        if is_playlist:
+            description = f"⏭️ Added **{len(songs)}** tracks to the front of the queue."
+        else:
+            song = songs[0]
+            description = f"⏭️ **[{song.title}]({song.url})** will play next."
+        await status.edit(embed=discord.Embed(description=description, color=discord.Color.green()))
+
+        if not was_playing:
+            await self.play_next(ctx)
+
+    @commands.hybrid_command(name='move', aliases=['mv'])
+    async def move(self, ctx, position: int, destination: int):
+        """Moves a queued song to a different position."""
+        queue = self.queues.get(ctx.guild.id)
+        if not queue or len(queue) < 2:
+            return await ctx.send(embed=discord.Embed(description="❌ There aren't enough songs queued to move anything.", color=discord.Color.red()))
+
+        for number in (position, destination):
+            if not 1 <= number <= len(queue):
+                return await ctx.send(embed=discord.Embed(
+                    description=f"❌ Invalid position. Pick a number between 1 and {len(queue)}.",
+                    color=discord.Color.red()))
+
+        if position == destination:
+            return await ctx.send(embed=discord.Embed(description="ℹ️ That song is already in that position.", color=discord.Color.blue()))
+
+        song = queue[position - 1]
+        # Same rule as removing: an admin, or the person who queued the song.
+        if not (ctx.author.guild_permissions.administrator or ctx.author.id == song.requester_id):
+            return await ctx.send(embed=discord.Embed(
+                description="❌ Only an admin or the person who queued that song can move it.",
+                color=discord.Color.red()))
+
+        queue.pop(position - 1)
+        queue.insert(destination - 1, song)
+        await self.save_queue_to_db(ctx.guild.id)
+        await ctx.send(embed=discord.Embed(
+            description=f"↕️ Moved **{song.title}** from **#{position}** to **#{destination}**.",
+            color=discord.Color.green()))
 
     @commands.hybrid_command(name='volume', aliases=['vol'])
     async def volume(self, ctx, volume: int = None):
