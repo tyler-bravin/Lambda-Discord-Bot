@@ -90,15 +90,29 @@
   .lyrics .muted { color: var(--muted); font-size: .95rem; font-weight: 500; opacity: 1; }
   .lyrics .plain { white-space: pre-wrap; font-size: 1rem; font-weight: 500; opacity: .85; color: #e6e8ec; }
 
-  .queue { margin-top: 30px; }
-  .queue h2 { font-size: .8rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
-  .qrow { display: flex; align-items: center; gap: 14px; padding: 10px 12px; border-radius: 14px;
-          transition: background .2s ease; }
-  .qrow:hover { background: var(--glass); }
-  .qrow img { width: 58px; height: 42px; object-fit: cover; border-radius: 8px; background: #1b1d22; }
-  .qrow .qt { font-size: .92rem; font-weight: 550; }
-  .qrow .qs { font-size: .76rem; color: var(--muted); margin-top: 1px; }
-  .qnum { color: var(--dim); width: 22px; text-align: right; font-size: .8rem; font-variant-numeric: tabular-nums; }
+  .queue { margin-top: 22px; }
+  .queue .card { padding: 20px 22px; }
+  .qhead { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  .qhead h2 { font-size: .8rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 0; }
+  .qcount { font-size: .78rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .qrow { display: flex; align-items: center; gap: 14px; padding: 9px 10px; border-radius: 14px;
+          transition: background .15s ease, transform .15s ease; }
+  .qrow:hover { background: var(--glass); transform: translateX(3px); }
+  .qnum { flex: none; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 8px;
+          background: rgba(255,255,255,.06); color: var(--muted); font-size: .72rem; font-weight: 700;
+          font-variant-numeric: tabular-nums; }
+  .qthumb { width: 56px; height: 42px; flex: none; object-fit: cover; border-radius: 8px; background: #1b1d22; }
+  .qmeta { min-width: 0; flex: 1; }
+  .qt { font-size: .92rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .qs { font-size: .76rem; color: var(--muted); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .qdur { flex: none; font-size: .76rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .pager { display: flex; align-items: center; justify-content: center; gap: 16px; margin-top: 14px; }
+  .pager button { background: var(--glass-strong); border: 1px solid var(--stroke); color: #fff; border-radius: 10px;
+                  padding: 7px 15px; font-size: .85rem; font-weight: 600; cursor: pointer;
+                  transition: background .2s ease, opacity .2s ease; }
+  .pager button:hover:not(:disabled) { background: rgba(255,255,255,.18); }
+  .pager button:disabled { opacity: .3; cursor: default; }
+  .pager .range { font-size: .78rem; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 130px; text-align: center; }
   .idle { color: var(--muted); padding: 34px 0; text-align: center; font-size: .9rem; }
 </style></head>
 <body>
@@ -118,17 +132,27 @@
     </div>
     <div class="card"><div id="lyrics" class="lyrics"><div class="muted">Lyrics will appear here.</div></div></div>
   </div>
-  <div class="queue"><h2>Up Next</h2><div id="queue"></div></div>
+  <div class="queue"><div class="card">
+    <div class="qhead"><h2>Up Next</h2><span id="qcount" class="qcount"></span></div>
+    <div id="queue"></div>
+    <div id="pager" class="pager" hidden>
+      <button id="prev" type="button">◀ Prev</button>
+      <span id="range" class="range"></span>
+      <button id="next" type="button">Next ▶</button>
+    </div>
+  </div></div>
 </div>
 <script>
 const GID = "__GID__";
+const PAGE = 10;
 const S = { url:null, duration:0, elapsed:0, syncTs:0, playing:false, paused:false,
-            controls:false, canControl:false, loggedIn:false, csrf:null, lyrics:[] };
+            controls:false, canControl:false, loggedIn:false, csrf:null, lyrics:[],
+            qOffset:0, qLen:0 };
 
 function fmt(s){ s=Math.max(0,Math.floor(s||0)); const m=Math.floor(s/60); return m+":"+String(s%60).padStart(2,"0"); }
 
 async function poll(){
-  try{ const r=await fetch(`/api/np/${GID}`); apply(await r.json()); }catch(e){}
+  try{ const r=await fetch(`/api/np/${GID}?offset=${S.qOffset}&limit=${PAGE}`); apply(await r.json()); }catch(e){}
 }
 function apply(d){
   S.controls=d.controls_enabled; S.canControl=d.can_control; S.loggedIn=d.logged_in; S.csrf=d.csrf||null;
@@ -154,23 +178,34 @@ function apply(d){
     document.getElementById("lyrics").innerHTML='<div class="muted">Nothing playing right now.</div>';
     S.lyrics=[];
   }
-  renderQueue(d.queue||[]);
+  renderQueue(d);
   renderControls(d);
 }
-function renderQueue(q){
-  const el=document.getElementById("queue");
-  if(!q.length){ el.innerHTML='<div class="idle">Queue is empty.</div>'; return; }
+function renderQueue(d){
+  const q = d.queue||[];
+  const total = d.queue_length||0;
+  const offset = d.queue_offset||0;
+  S.qLen = total; S.qOffset = offset;
+  const el=document.getElementById("queue"), pager=document.getElementById("pager");
+  document.getElementById("qcount").textContent = total ? total+" song"+(total>1?"s":"") : "";
+  if(!total){ el.innerHTML='<div class="idle">Queue is empty.</div>'; pager.hidden=true; return; }
   el.innerHTML="";
   q.forEach((s,i)=>{
     const row=document.createElement("div"); row.className="qrow";
-    const num=document.createElement("div"); num.className="qnum"; num.textContent=(i+1);
-    const img=document.createElement("img"); img.src=s.thumbnail||""; img.alt="";
-    const box=document.createElement("div");
+    const num=document.createElement("div"); num.className="qnum"; num.textContent=offset+i+1;
+    const img=document.createElement("img"); img.className="qthumb"; img.src=s.thumbnail||""; img.alt="";
+    const meta=document.createElement("div"); meta.className="qmeta";
     const qt=document.createElement("div"); qt.className="qt"; qt.textContent=s.title||"";
     const qs=document.createElement("div"); qs.className="qs"; qs.textContent=s.uploader||"";
-    box.appendChild(qt); box.appendChild(qs);
-    row.appendChild(num); row.appendChild(img); row.appendChild(box); el.appendChild(row);
+    meta.appendChild(qt); meta.appendChild(qs);
+    const dur=document.createElement("div"); dur.className="qdur"; dur.textContent=s.duration?fmt(s.duration):"";
+    row.appendChild(num); row.appendChild(img); row.appendChild(meta); row.appendChild(dur);
+    el.appendChild(row);
   });
+  document.getElementById("range").textContent = `${offset+1}–${offset+q.length} of ${total}`;
+  document.getElementById("prev").disabled = offset<=0;
+  document.getElementById("next").disabled = offset+PAGE>=total;
+  pager.hidden = total<=PAGE;
 }
 function renderControls(d){
   const bar=document.getElementById("controls"), msg=document.getElementById("cmsg");
@@ -237,5 +272,7 @@ function tick(){
     }
   }
 }
+document.getElementById("prev").onclick=()=>{ S.qOffset=Math.max(0,S.qOffset-PAGE); poll(); };
+document.getElementById("next").onclick=()=>{ if(S.qOffset+PAGE<S.qLen){ S.qOffset+=PAGE; poll(); } };
 poll(); setInterval(poll, 2500); setInterval(tick, 250);
 </script></body></html>

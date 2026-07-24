@@ -316,12 +316,21 @@ class WebServer(commands.Cog):
         music = self.bot.get_cog("Music")
         return guild, music
 
+    @staticmethod
+    def _int_param(request: web.Request, name: str, default: int) -> int:
+        try:
+            return int(request.query.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
     async def handle_np_data(self, request: web.Request) -> web.Response:
         guild, music = self._np_context(request)
         if guild is None or music is None:
             return web.json_response({"error": "unknown guild"}, status=404)
 
-        data = music.web_snapshot(guild)
+        offset = self._int_param(request, "offset", 0)
+        limit = self._int_param(request, "limit", 10)
+        data = music.web_snapshot(guild, offset=offset, limit=limit)
         data["controls_enabled"] = self.controls
         session = self._session(request)
         data["logged_in"] = bool(session)

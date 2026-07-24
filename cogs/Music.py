@@ -1410,8 +1410,13 @@ class Music(commands.Cog):
     # These methods let the optional web "now playing" screen read state and,
     # when enabled, drive playback. Permission mirrors the bot: an admin, or a
     # user currently in the bot's voice channel, may control.
-    def web_snapshot(self, guild) -> dict:
-        """A JSON-serializable snapshot of the guild's player for the web UI."""
+    def web_snapshot(self, guild, offset: int = 0, limit: int = 10) -> dict:
+        """
+        A JSON-serializable snapshot of the guild's player for the web UI.
+
+        The queue is paginated: ``offset``/``limit`` select a window, and the full
+        length is reported separately so the page can render page controls.
+        """
         gid = guild.id
         vc = guild.voice_client
         playing = bool(vc and vc.is_playing())
@@ -1436,10 +1441,13 @@ class Music(commands.Cog):
                 "requester": getattr(song.requester, "display_name", None),
             }
 
+        full_queue = self.queues.get(gid, [])
+        limit = max(1, min(limit, 50))
+        offset = max(0, min(offset, max(0, len(full_queue) - 1)))
         queue = [{
             "title": s.title, "url": s.url, "thumbnail": s.thumbnail,
             "duration": s.duration, "uploader": s.uploader,
-        } for s in self.queues.get(gid, [])[:25]]
+        } for s in full_queue[offset:offset + limit]]
 
         return {
             "connected": bool(vc and vc.is_connected()),
@@ -1447,7 +1455,8 @@ class Music(commands.Cog):
             "paused": paused,
             "now": now,
             "queue": queue,
-            "queue_length": len(self.queues.get(gid, [])),
+            "queue_offset": offset,
+            "queue_length": len(full_queue),
             "volume": self.guild_volumes.get(gid, 50),
             "loop": self.loop_states.get(gid, "off"),
         }
