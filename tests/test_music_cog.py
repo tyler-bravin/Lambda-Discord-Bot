@@ -517,6 +517,43 @@ async def test_move_rejects_out_of_range(music_cog, mock_ctx):
     assert "Invalid position" in embed.description
 
 
+# --- Playback Messaging Tests ---
+
+@pytest.mark.asyncio
+async def test_announce_uses_channel_not_interaction(music_cog):
+    """Playback messages go via the channel (permanent token), not ctx.send."""
+    ctx = MagicMock()
+    ctx.channel.send = AsyncMock(return_value="msg")
+    ctx.send = AsyncMock()
+
+    result = await music_cog._announce(ctx, content="hi")
+
+    assert result == "msg"
+    ctx.channel.send.assert_awaited_once_with(content="hi")
+    ctx.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_announce_swallows_http_errors(music_cog):
+    """A failed status message (e.g. expired token) must not raise / stop playback."""
+    ctx = MagicMock()
+    ctx.channel.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
+
+    result = await music_cog._announce(ctx, content="hi")  # must not raise
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_player_message_ignores_expired_token(music_cog):
+    """Editing an old now-playing message that 401s must be swallowed."""
+    old = AsyncMock()
+    old.edit.side_effect = discord.HTTPException(MagicMock(), "Invalid Webhook Token")
+    music_cog.now_playing_messages[42] = old
+
+    await music_cog._cleanup_player_message(42)  # must not raise
+    assert 42 not in music_cog.now_playing_messages
+
+
 # --- Web Player Tests ---
 
 def _guild_with_vc(playing=True):
