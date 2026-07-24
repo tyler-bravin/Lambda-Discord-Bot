@@ -674,6 +674,22 @@ class Music(commands.Cog):
         if ctx.guild.voice_client:
             await self.play_next(ctx)
 
+    async def _now_playing_message(self, ctx, guild_id, player):
+        """Builds and sends the 'Now Playing' embed with player controls."""
+        embed = discord.Embed(title="🎶 Now Playing",
+                              description=f"[{player.title}]({player.url})", color=discord.Color.blue())
+        if player.thumbnail:
+            embed.set_thumbnail(url=player.thumbnail)
+        embed.add_field(name="Uploader", value=player.uploader or "Unknown", inline=True)
+        if player.duration:
+            # Some sources report duration as a float; int() keeps ':02d' happy.
+            minutes, seconds = divmod(int(player.duration), 60)
+            embed.add_field(name="Duration", value=f"{minutes}:{seconds:02d}", inline=True)
+        embed.set_footer(text=f"Requested by {player.requester.display_name}",
+                         icon_url=player.requester.display_avatar.url)
+        controls = PlayerControls(self, player, player_url=self._player_url(guild_id))
+        return await self._announce(ctx, embed=embed, view=controls)
+
     async def _announce(self, ctx, **kwargs):
         """
         Sends a playback status message via the text channel rather than ctx.send.
@@ -774,31 +790,23 @@ class Music(commands.Cog):
             self.current_song[guild_id] = next_song
             self.song_start_times[guild_id] = time.time()
 
-            # Remember where we're playing so the queue can resume after a restart.
+            # --- Critical state first: these must happen even if the cosmetic
+            # 'Now Playing' message below fails, or the queue would desync. ---
             channel = getattr(ctx, 'channel', None)
             if channel is not None:
                 await self.save_session(guild_id, vc.channel.id, channel.id)
-
+            await self.save_queue_to_db(guild_id)
+            await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.playing, name=player.title))
             # Warm up the next song in the background for a gapless transition.
             if self.queues.get(guild_id):
                 self.bot.loop.create_task(self._prefetch_next(guild_id))
 
-            # Create and send the 'Now Playing' embed with controls.
-            embed = discord.Embed(title="🎶 Now Playing", description=f"[{player.title}]({player.url})", color=discord.Color.blue())
-            if player.thumbnail: embed.set_thumbnail(url=player.thumbnail)
-            embed.add_field(name="Uploader", value=player.uploader, inline=True)
-            if player.duration:
-                duration_min, duration_sec = divmod(player.duration, 60)
-                embed.add_field(name="Duration", value=f"{duration_min}:{duration_sec:02d}", inline=True)
-            embed.set_footer(text=f"Requested by {player.requester.display_name}", icon_url=player.requester.display_avatar.url)
-
-            controls = PlayerControls(self, player, player_url=self._player_url(guild_id))
-            now_playing_message = await self._announce(ctx, embed=embed, view=controls)
-            self.now_playing_messages[guild_id] = now_playing_message
-
-            # Update the bot's rich presence to show the currently playing song.
-            await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.playing, name=player.title))
-            await self.save_queue_to_db(guild_id)
+            # Post the 'Now Playing' message. Best-effort: an embed/send error
+            # here must never crash the queue advance (it runs in a callback).
+            try:
+                self.now_playing_messages[guild_id] = await self._now_playing_message(ctx, guild_id, player)
+            except Exception:
+                log.exception("Failed to post the now-playing message in guild %s", guild_id)
         else:
             # Autoplay: when the queue empties, try to keep the music going with a
             # related track before declaring the queue finished.
