@@ -543,6 +543,21 @@ def test_web_snapshot(music_cog):
     assert snap["queue_length"] == 1 and len(snap["queue"]) == 1
 
 
+def test_web_snapshot_paginates(music_cog):
+    guild, vc = _guild_with_vc()
+    music_cog.queues[guild.id] = [Song(playlist_entry_1, MagicMock()) for _ in range(37)]
+
+    page1 = music_cog.web_snapshot(guild, offset=0, limit=10)
+    assert len(page1["queue"]) == 10 and page1["queue_offset"] == 0 and page1["queue_length"] == 37
+
+    page_last = music_cog.web_snapshot(guild, offset=30, limit=10)
+    assert len(page_last["queue"]) == 7 and page_last["queue_offset"] == 30
+
+    # Out-of-range offset is clamped, never errors.
+    clamped = music_cog.web_snapshot(guild, offset=999, limit=10)
+    assert clamped["queue_offset"] == 36 and len(clamped["queue"]) == 1
+
+
 def test_web_can_control(music_cog):
     guild, vc = _guild_with_vc()
     channel = MagicMock()
