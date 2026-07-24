@@ -61,9 +61,29 @@ class Help(commands.Cog):
             lines = [f"`{prefix}{c.name}` — {c.short_doc or 'No description.'}"
                      for c in sorted(visible, key=lambda c: c.name)]
             emoji = self.COG_EMOJI.get(cog_name, "•")
-            embed.add_field(name=f"{emoji} {cog_name}", value="\n".join(lines), inline=False)
+            # Discord caps each embed field value at 1024 chars, so a long
+            # category is split across as many fields as it needs.
+            for i, chunk in enumerate(self._chunk_lines(lines)):
+                name = f"{emoji} {cog_name}" if i == 0 else f"{emoji} {cog_name} (cont.)"
+                embed.add_field(name=name, value=chunk, inline=False)
 
         await ctx.send(embed=embed)
+
+    @staticmethod
+    def _chunk_lines(lines, limit=1024):
+        """Groups lines into newline-joined blocks each within Discord's field limit."""
+        blocks, current, length = [], [], 0
+        for line in lines:
+            extra = len(line) + (1 if current else 0)
+            if length + extra > limit and current:
+                blocks.append("\n".join(current))
+                current, length = [], 0
+                extra = len(line)
+            current.append(line)
+            length += extra
+        if current:
+            blocks.append("\n".join(current))
+        return blocks
 
     async def _command_help(self, ctx: commands.Context, name: str):
         """Shows detailed usage for a single command."""
