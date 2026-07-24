@@ -1470,31 +1470,88 @@ class Music(commands.Cog):
             return True
         return bool(member.voice and member.voice.channel == vc.channel)
 
+    def _is_requester(self, gid, member) -> bool:
+        """Whether the member queued the currently playing song."""
+        song = self.current_song.get(gid)
+        return bool(song and getattr(song, "requester_id", None) == member.id)
+
+    def _web_vote(self, guild, member, votes: set, *, can_force: bool):
+        """
+        Tallies a web control vote against a shared vote set — the same set the
+        Discord commands use, so votes cast in chat and on the web combine.
+        Returns ``(passed, message)``; ``passed`` is True when the action should
+        run now (threshold met or the member can force it).
+        """
+        if can_force:
+            return True, None
+        status, count, required = self._tally_vote(guild.voice_client, votes, member.id)
+        if status == self.VOTE_PASSED:
+            return True, f"🗳️ Vote passed ({count}/{required})."
+        if status == self.VOTE_ALREADY:
+            return False, f"You've already voted ({count}/{required} needed)."
+        return False, f"🗳️ Vote added — {count}/{required} needed."
+
     async def web_control(self, guild, member, action: str, value=None) -> dict:
-        """Applies a control action from the web UI, after checking permission."""
+        """
+        Applies a control action from the web UI.
+
+        Skip, pause and stop go through the SAME majority-vote system as the
+        Discord commands (sharing the vote sets, so votes combine across both). An
+        admin — or, for skip/pause, the song's requester — bypasses the vote.
+        Resume, previous and volume act directly, matching Discord.
+        """
         if not self.web_can_control(guild, member):
             return {"ok": False, "error": "You must be an admin or in the bot's voice channel."}
 
         gid = guild.id
         vc = guild.voice_client
-        if action == "pause":
-            if vc.is_playing():
-                vc.pause()
-                self.inactive_since[gid] = time.time()
-        elif action == "resume":
+        is_admin = member.guild_permissions.administrator
+
+        if action == "resume":
             if vc.is_paused():
                 vc.resume()
                 self.inactive_since.pop(gid, None)
                 self.pause_votes.pop(gid, None)
-        elif action == "skip":
-            if vc.is_playing() or vc.is_paused():
-                vc.stop()
-        elif action == "stop":
+            return {"ok": True}
+
+        if action == "pause":
+            if not vc.is_playing():
+                return {"ok": False, "error": "Nothing is playing."}
+            passed, msg = self._web_vote(guild, member, self.pause_votes.setdefault(gid, set()),
+                                         can_force=is_admin or self._is_requester(gid, member))
+            if not passed:
+                return {"ok": False, "pending": True, "message": msg}
+            self.pause_votes.pop(gid, None)
+            vc.pause()
+            self.inactive_since[gid] = time.time()
+            return {"ok": True, "message": msg}
+
+        if action == "skip":
+            if not (vc.is_playing() or vc.is_paused()):
+                return {"ok": False, "error": "Nothing to skip."}
+            passed, msg = self._web_vote(guild, member, self.skip_votes.setdefault(gid, set()),
+                                         can_force=is_admin or self._is_requester(gid, member))
+            if not passed:
+                return {"ok": False, "pending": True, "message": msg}
+            self.skip_votes.pop(gid, None)
+            vc.stop()
+            return {"ok": True, "message": msg}
+
+        if action == "stop":
+            passed, msg = self._web_vote(guild, member, self.stop_votes.setdefault(gid, set()),
+                                         can_force=is_admin)
+            if not passed:
+                return {"ok": False, "pending": True, "message": msg}
+            self.stop_votes.pop(gid, None)
             await self._web_stop(guild)
-        elif action == "previous":
+            return {"ok": True, "message": msg}
+
+        if action == "previous":
             if not await self._web_previous(guild):
                 return {"ok": False, "error": "There's no previous song."}
-        elif action == "volume":
+            return {"ok": True}
+
+        if action == "volume":
             try:
                 v = max(0, min(200, int(value)))
             except (TypeError, ValueError):
@@ -1503,9 +1560,9 @@ class Music(commands.Cog):
             if vc.source:
                 vc.source.volume = v / 100
             await self.save_volume_to_db(gid, v)
-        else:
-            return {"ok": False, "error": "Unknown action."}
-        return {"ok": True}
+            return {"ok": True}
+
+        return {"ok": False, "error": "Unknown action."}
 
     async def _web_stop(self, guild):
         """Stops playback and clears the queue (no vote, no chat response)."""

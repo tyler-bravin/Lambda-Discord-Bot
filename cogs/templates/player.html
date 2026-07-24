@@ -114,9 +114,16 @@
   .pager button:disabled { opacity: .3; cursor: default; }
   .pager .range { font-size: .78rem; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 130px; text-align: center; }
   .idle { color: var(--muted); padding: 34px 0; text-align: center; font-size: .9rem; }
+  .toast { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(20px);
+           background: rgba(20,22,28,.92); border: 1px solid var(--stroke); color: #fff;
+           padding: 11px 20px; border-radius: 12px; font-size: .88rem; font-weight: 600;
+           box-shadow: 0 14px 34px rgba(0,0,0,.5); opacity: 0; pointer-events: none; z-index: 20;
+           backdrop-filter: blur(12px); transition: opacity .25s ease, transform .25s ease; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 </style></head>
 <body>
   <div id="bg"></div><div id="veil"></div>
+  <div id="toast" class="toast"></div>
   <div class="wrap">
   <h1>🎧 __GNAME__</h1>
   <div class="grid">
@@ -224,11 +231,21 @@ function renderControls(d){
   const vol=document.createElement("input"); vol.type="range"; vol.min=0; vol.max=200; vol.value=d.volume||50;
   vol.className="vol"; vol.onchange=()=>control("volume", vol.value); bar.appendChild(vol);
 }
+let toastT;
+function flash(text){
+  if(!text) return;
+  const t=document.getElementById("toast"); t.textContent=text; t.classList.add("show");
+  clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("show"), 3500);
+}
 async function control(action, value){
   if(!S.csrf) return;
   const body=new URLSearchParams({csrf:S.csrf, action});
   if(value!==undefined) body.set("value", value);
-  try{ await fetch(`/api/np/${GID}/control`, {method:"POST", body}); }catch(e){}
+  try{
+    const r=await fetch(`/api/np/${GID}/control`, {method:"POST", body});
+    const d=await r.json().catch(()=>({}));
+    flash(d.message || d.error);
+  }catch(e){}
   poll();
 }
 async function loadLyrics(){

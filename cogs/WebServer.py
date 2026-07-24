@@ -357,7 +357,9 @@ class WebServer(commands.Cog):
 
         member = guild.get_member(int(session["uid"]))
         result = await music.web_control(guild, member, data.get("action", ""), data.get("value"))
-        return web.json_response(result, status=200 if result.get("ok") else 400)
+        # A pending vote isn't an error — it's a valid outcome carrying a message.
+        ok = result.get("ok") or result.get("pending")
+        return web.json_response(result, status=200 if ok else 400)
 
     @staticmethod
     def _clean_track_title(title: str) -> str:
