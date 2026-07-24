@@ -1,8 +1,10 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import cogs.sources as sources
 from cogs.sources import (
     Song,
+    extract_info_blocking,
     identify,
     is_soundcloud_set,
     is_youtube_playlist,
@@ -11,6 +13,53 @@ from cogs.sources import (
     resolve_query,
     resolve_spotify,
 )
+
+
+# --- Cookie-free extraction with search fallback ---
+
+def test_extraction_uses_plain_instance(monkeypatch):
+    """Streams resolve through the cookie-free instance (avoids SABR formats)."""
+    plain = MagicMock()
+    plain.extract_info.return_value = {"title": "song", "format_id": "251"}
+    monkeypatch.setattr(sources, "_plain_ytdl", plain)
+    monkeypatch.setattr(sources, "_cookied_search_options", None)
+
+    result = extract_info_blocking("https://youtube.com/watch?v=abc")
+
+    assert result["format_id"] == "251"
+    plain.extract_info.assert_called_once()
+
+
+def test_search_falls_back_to_cookies_when_empty(monkeypatch):
+    """An empty text search retries via cookies, then resolves the winner plainly."""
+    plain = MagicMock()
+    # First call (plain search) returns nothing; second (resolve found URL) succeeds.
+    plain.extract_info.side_effect = [{"entries": []}, {"title": "explicit song"}]
+    monkeypatch.setattr(sources, "_plain_ytdl", plain)
+    monkeypatch.setattr(sources, "_cookied_search_options", {"quiet": True})
+    monkeypatch.setattr(sources, "_cookied_search_first_url",
+                        lambda q: "https://www.youtube.com/watch?v=xyz")
+
+    result = extract_info_blocking("some explicit words")
+
+    assert result["title"] == "explicit song"
+    assert plain.extract_info.call_count == 2
+    # The second plain call resolved the URL the cookied search discovered.
+    assert plain.extract_info.call_args_list[1].args[0] == "https://www.youtube.com/watch?v=xyz"
+
+
+def test_no_cookie_fallback_for_urls(monkeypatch):
+    """A direct URL that returns nothing does not trigger the cookied search."""
+    plain = MagicMock()
+    plain.extract_info.return_value = None
+    calls = []
+    monkeypatch.setattr(sources, "_plain_ytdl", plain)
+    monkeypatch.setattr(sources, "_cookied_search_options", {"quiet": True})
+    monkeypatch.setattr(sources, "_cookied_search_first_url", lambda q: calls.append(q))
+
+    extract_info_blocking("https://youtube.com/watch?v=dead")
+
+    assert calls == []  # never fell back for a URL
 
 
 # --- Platform detection ---
