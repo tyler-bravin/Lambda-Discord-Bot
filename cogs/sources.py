@@ -82,29 +82,37 @@ ytdl_format_options = {
     'socket_timeout': 15,
 }
 
-_cookie_file = _find_cookie_file()
-if _cookie_file:
-    ytdl_format_options['cookiefile'] = _cookie_file
-    log.info("Using YouTube cookies from %s", _cookie_file)
-
-# Alternative to a cookies file for non-Docker setups: read cookies straight from
-# a browser profile on the same machine, e.g. "chrome" or "firefox:ProfileName".
-# Inside a container there is no browser, so use the cookies file there instead.
-_cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
-if _cookies_from_browser:
-    browser, _, profile = _cookies_from_browser.partition(':')
-    ytdl_format_options['cookiesfrombrowser'] = (browser, profile or None, None, None)
-    log.info("Reading YouTube cookies from browser: %s", _cookies_from_browser)
-
 # Optional PO token provider (bgutil-ytdlp-pot-provider sidecar). This is what
 # lets YouTube playback keep working headlessly without any cookies for normal
 # videos — it answers YouTube's "confirm you're not a bot" attestation checks.
+# Added to the base options so it applies to both the plain and cookied instances.
 _pot_provider_url = os.getenv("POT_PROVIDER_URL")
 if _pot_provider_url:
     ytdl_format_options['extractor_args'] = {
         'youtubepot-bgutilhttp': {'base_url': [_pot_provider_url]},
     }
     log.info("Using PO token provider at %s", _pot_provider_url)
+
+# Cookies are deliberately kept OUT of the main options. A logged-in YouTube
+# session is served SABR-only streaming formats that yt-dlp can't play, so using
+# cookies to resolve a stream breaks playback for *every* song. Instead they're
+# used only as a fallback to defeat safe-search filtering when a plain text
+# search returns nothing — and even then we re-resolve the winning video's stream
+# without cookies. See extract_info_blocking below.
+_cookied_search_options = None
+_cookie_file = _find_cookie_file()
+# A browser profile is the non-Docker alternative to a cookies file, e.g.
+# "chrome" or "firefox:ProfileName". A headless container has no browser.
+_cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
+if _cookie_file or _cookies_from_browser:
+    _cookied_search_options = dict(ytdl_format_options)
+    if _cookie_file:
+        _cookied_search_options['cookiefile'] = _cookie_file
+        log.info("YouTube cookies (search fallback only) from %s", _cookie_file)
+    if _cookies_from_browser:
+        browser, _, profile = _cookies_from_browser.partition(':')
+        _cookied_search_options['cookiesfrombrowser'] = (browser, profile or None, None, None)
+        log.info("Reading YouTube cookies (search fallback only) from browser: %s", _cookies_from_browser)
 
 # Configuration for FFmpeg, the audio processing library.
 ffmpeg_options = {
@@ -122,13 +130,25 @@ def create_ytdl() -> yt_dlp.YoutubeDL:
     return yt_dlp.YoutubeDL(ytdl_format_options)
 
 
-# All extractions go through one shared YoutubeDL instance behind a lock. This
-# serializes yt-dlp (whose instances are not thread-safe) and, crucially, keeps a
-# single cookie jar alive: YouTube *rotates* cookies during use, and saving the
-# jar after every extraction writes the rotated values back to cookies.txt so the
-# file never goes stale and never needs to be re-exported by hand.
+# Extractions are serialized behind a lock (yt-dlp instances aren't thread-safe).
+# Two shared instances: a cookie-free one for all stream resolution, and a cookied
+# one used only for the safe-search fallback.
 _ytdl_lock = threading.Lock()
-_shared_ytdl: Optional[yt_dlp.YoutubeDL] = None
+_plain_ytdl: Optional[yt_dlp.YoutubeDL] = None
+_cookied_ytdl: Optional[yt_dlp.YoutubeDL] = None
+
+
+def _is_url(query: str) -> bool:
+    return query.startswith("http://") or query.startswith("https://")
+
+
+def _has_results(data) -> bool:
+    """Whether an extraction returned anything playable (search or single video)."""
+    if not data:
+        return False
+    if "entries" in data:
+        return any(data["entries"])
+    return True
 
 
 def _save_cookies(ydl: yt_dlp.YoutubeDL):
@@ -141,14 +161,52 @@ def _save_cookies(ydl: yt_dlp.YoutubeDL):
         log.debug("Could not save rotated cookies: %s", e)
 
 
+def _cookied_search_first_url(query: str) -> Optional[str]:
+    """
+    Searches YouTube *with cookies* (which defeats safe-search filtering) and
+    returns the top result's watch URL — without extracting its stream, so the
+    SABR-only format problem never arises here.
+    """
+    global _cookied_ytdl
+    try:
+        if _cookied_ytdl is None:
+            _cookied_ytdl = yt_dlp.YoutubeDL({**_cookied_search_options, 'extract_flat': 'in_playlist'})
+        data = _cookied_ytdl.extract_info(query, download=False)
+        _save_cookies(_cookied_ytdl)
+        entries = data.get("entries") if data else None
+        if not entries:
+            return None
+        first = entries[0]
+        video_id = first.get("id")
+        url = first.get("url") or first.get("webpage_url")
+        if video_id and (not url or not url.startswith("http")):
+            url = f"https://www.youtube.com/watch?v={video_id}"
+        return url
+    except Exception:
+        log.debug("Cookied fallback search failed", exc_info=True)
+        return None
+
+
 def extract_info_blocking(query: str, download: bool = False) -> dict:
-    """Thread-safe yt-dlp extraction. Blocking — run in an executor."""
-    global _shared_ytdl
+    """
+    Thread-safe yt-dlp extraction. Blocking — run in an executor.
+
+    Streams are always resolved WITHOUT cookies: a logged-in YouTube session is
+    served SABR-only formats that can't be played, so cookies would break every
+    song. Cookies are used only as a fallback — when a plain *text* search finds
+    nothing (YouTube's safe-search hiding explicit results) we re-run the search
+    with cookies to discover the video, then resolve its stream cookie-free.
+    """
+    global _plain_ytdl
     with _ytdl_lock:
-        if _shared_ytdl is None:
-            _shared_ytdl = create_ytdl()
-        data = _shared_ytdl.extract_info(query, download=download)
-        _save_cookies(_shared_ytdl)
+        if _plain_ytdl is None:
+            _plain_ytdl = create_ytdl()
+        data = _plain_ytdl.extract_info(query, download=download)
+
+        if not _is_url(query) and not _has_results(data) and _cookied_search_options:
+            url = _cookied_search_first_url(query)
+            if url:
+                data = _plain_ytdl.extract_info(url, download=download)
         return data
 
 
