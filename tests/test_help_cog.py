@@ -60,3 +60,19 @@ async def test_help_hidden_command_hidden_from_non_owner():
     # A non-owner asking about a hidden command is told it doesn't exist.
     embed = ctx.send.call_args.kwargs["embed"]
     assert "no command" in embed.description.lower()
+
+
+def test_chunk_lines_stays_within_field_limit():
+    """Long categories split into multiple fields, each within Discord's 1024 cap."""
+    lines = [f"`!command{i}` — a reasonably long description of this command's behaviour" for i in range(30)]
+    blocks = Help._chunk_lines(lines)
+
+    assert len(blocks) > 1  # this input overflows a single field
+    assert all(len(b) <= 1024 for b in blocks)
+    # No line is dropped or split across blocks.
+    assert sum(b.count("\n") + 1 for b in blocks) == len(lines)
+
+
+def test_chunk_lines_single_block_when_small():
+    blocks = Help._chunk_lines(["`!a` — one", "`!b` — two"])
+    assert blocks == ["`!a` — one\n`!b` — two"]
