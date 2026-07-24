@@ -520,6 +520,40 @@ async def test_move_rejects_out_of_range(music_cog, mock_ctx):
 # --- Playback Messaging Tests ---
 
 @pytest.mark.asyncio
+async def test_now_playing_message_handles_float_duration(music_cog, mock_ctx, mock_player):
+    """A float duration must not crash the 'Duration' field formatting."""
+    mock_player.duration = 213.0  # some sources report floats
+    mock_ctx.channel.send = AsyncMock(return_value="msg")
+
+    result = await music_cog._now_playing_message(mock_ctx, mock_ctx.guild.id, mock_player)
+
+    assert result == "msg"
+    embed = mock_ctx.channel.send.call_args.kwargs["embed"]
+    dur_field = next(f for f in embed.fields if f.name == "Duration")
+    assert dur_field.value == "3:33"
+
+
+@pytest.mark.asyncio
+async def test_play_next_survives_now_playing_error(music_cog, mock_ctx, mock_player):
+    """A failing now-playing message must not stop the queue (save still runs)."""
+    song = Song(full_song_data, mock_ctx.author)
+    music_cog.queues[mock_ctx.guild.id] = [song]
+    mock_ctx.guild.voice_client = MagicMock()
+    mock_ctx.guild.voice_client.is_connected.return_value = True
+
+    with patch('cogs.Music.YTDLSource.from_data', new_callable=AsyncMock) as mock_from_data:
+        mock_from_data.return_value = mock_player
+        with patch.object(music_cog, '_now_playing_message', new_callable=AsyncMock) as mock_np:
+            mock_np.side_effect = ValueError("embed boom")
+            await music_cog.play_next(mock_ctx)  # must not raise
+
+    mock_ctx.guild.voice_client.play.assert_called_once()  # song still started
+    music_cog.save_queue_to_db.assert_awaited()            # queue still persisted
+
+
+
+
+@pytest.mark.asyncio
 async def test_announce_uses_channel_not_interaction(music_cog):
     """Playback messages go via the channel (permanent token), not ctx.send."""
     ctx = MagicMock()
