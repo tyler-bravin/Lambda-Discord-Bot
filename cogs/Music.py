@@ -408,8 +408,9 @@ class Music(commands.Cog):
         if old_message:
             try:
                 await old_message.edit(view=None)
-            except (discord.NotFound, discord.Forbidden):
-                # Ignore if the message was already deleted manually.
+            except discord.HTTPException:
+                # Best-effort cleanup — ignore if the message is gone or its
+                # (interaction) token has expired. Must never stop playback.
                 pass
 
     async def _handle_disconnect(self, vc: discord.VoiceClient):
@@ -673,6 +674,25 @@ class Music(commands.Cog):
         if ctx.guild.voice_client:
             await self.play_next(ctx)
 
+    async def _announce(self, ctx, **kwargs):
+        """
+        Sends a playback status message via the text channel rather than ctx.send.
+
+        play_next reuses the original command's context for the whole listening
+        session, but a slash command's interaction webhook token expires after
+        15 minutes — after which ctx.send/edit fails with 401 and, unhandled,
+        stops the queue advancing. The channel's own token never expires. Send
+        failures are swallowed so a missing status message never halts the music.
+        """
+        channel = getattr(ctx, "channel", None)
+        if channel is None:
+            return None
+        try:
+            return await channel.send(**kwargs)
+        except discord.HTTPException:
+            log.debug("Could not send playback status message", exc_info=True)
+            return None
+
     async def play_next(self, ctx):
         """
         The main playback handler. Pops the next song, plays it, and updates state.
@@ -706,7 +726,7 @@ class Music(commands.Cog):
                 except Exception:
                     log.exception("Failed to resolve %r", next_song.title)
                 if not resolved:
-                    await ctx.send(embed=discord.Embed(
+                    await self._announce(ctx, embed=discord.Embed(
                         title="❌ Playback Error",
                         description=f"Could not find a playable video for `{next_song.title}`. Skipping.",
                         color=discord.Color.red()))
@@ -739,7 +759,7 @@ class Music(commands.Cog):
                         log.exception("Retry with fresh extraction also failed for %r", next_song.title)
 
             if player is None:
-                await ctx.send(embed=discord.Embed(
+                await self._announce(ctx, embed=discord.Embed(
                     title="❌ Playback Error",
                     description=f"Could not play `{next_song.title}`.\nIt may be unavailable or restricted.\nSkipping.",
                     color=discord.Color.red()))
@@ -773,7 +793,7 @@ class Music(commands.Cog):
             embed.set_footer(text=f"Requested by {player.requester.display_name}", icon_url=player.requester.display_avatar.url)
 
             controls = PlayerControls(self, player, player_url=self._player_url(guild_id))
-            now_playing_message = await ctx.send(embed=embed, view=controls)
+            now_playing_message = await self._announce(ctx, embed=embed, view=controls)
             self.now_playing_messages[guild_id] = now_playing_message
 
             # Update the bot's rich presence to show the currently playing song.
@@ -791,7 +811,7 @@ class Music(commands.Cog):
             # Nothing left to resume, so forget the saved session.
             await self.clear_session(guild_id)
             await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f"{self.bot.command_prefix}play"))
-            await ctx.send(embed=discord.Embed(description="✅ Queue finished.", color=discord.Color.green()))
+            await self._announce(ctx, embed=discord.Embed(description="✅ Queue finished.", color=discord.Color.green()))
             self.inactive_since[guild_id] = time.time()
 
     # --- Event Listeners & Background Tasks ---
