@@ -603,6 +603,72 @@ async def test_web_control_pause_for_admin(music_cog):
     vc.pause.assert_called_once()
 
 
+def _listener_in_channel(vc, uid):
+    m = MagicMock()
+    m.id = uid
+    m.bot = False  # counts as a human listener for the vote threshold
+    m.guild_permissions.administrator = False
+    m.voice.channel = vc.channel
+    return m
+
+
+@pytest.mark.asyncio
+async def test_web_skip_requires_vote(music_cog):
+    """A non-admin, non-requester web skip registers a vote instead of skipping."""
+    guild, vc = _guild_with_vc()
+    # Three human listeners -> majority of 2 required.
+    vc.channel.members = [_listener_in_channel(vc, i) for i in range(3)]
+    music_cog.current_song[guild.id] = Song(full_song_data, MagicMock(id=99))  # requester is someone else
+
+    voter = _listener_in_channel(vc, 1)
+    result = await music_cog.web_control(guild, voter, "skip")
+
+    assert result["ok"] is False and result["pending"] is True
+    assert "1/2" in result["message"]
+    vc.stop.assert_not_called()
+    assert 1 in music_cog.skip_votes[guild.id]
+
+
+@pytest.mark.asyncio
+async def test_web_skip_passes_on_second_vote(music_cog):
+    guild, vc = _guild_with_vc()
+    vc.channel.members = [_listener_in_channel(vc, i) for i in range(3)]  # need 2
+    music_cog.current_song[guild.id] = Song(full_song_data, MagicMock(id=99))
+    music_cog.skip_votes[guild.id] = {1}  # one vote already in (e.g. from Discord)
+
+    result = await music_cog.web_control(guild, _listener_in_channel(vc, 2), "skip")
+
+    assert result["ok"] is True
+    vc.stop.assert_called_once()
+    assert guild.id not in music_cog.skip_votes  # votes cleared on pass
+
+
+@pytest.mark.asyncio
+async def test_web_skip_requester_bypasses_vote(music_cog):
+    guild, vc = _guild_with_vc()
+    vc.channel.members = [_listener_in_channel(vc, i) for i in range(3)]
+    requester = _listener_in_channel(vc, 5)
+    music_cog.current_song[guild.id] = Song(full_song_data, MagicMock(id=5))  # this member queued it
+
+    result = await music_cog.web_control(guild, requester, "skip")
+
+    assert result["ok"] is True
+    vc.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_web_stop_requires_vote_for_non_admin(music_cog):
+    """Stop wipes the queue, so a non-admin must pass a vote first."""
+    guild, vc = _guild_with_vc()
+    vc.channel.members = [_listener_in_channel(vc, i) for i in range(3)]
+    music_cog.queues[guild.id] = [Song(playlist_entry_1, MagicMock()) for _ in range(5)]
+
+    result = await music_cog.web_control(guild, _listener_in_channel(vc, 1), "stop")
+
+    assert result["ok"] is False and result["pending"] is True
+    assert len(music_cog.queues[guild.id]) == 5  # queue untouched
+
+
 # --- UI and Other Feature Tests ---
 
 @pytest.mark.asyncio
