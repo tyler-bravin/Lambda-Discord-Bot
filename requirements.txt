@@ -1,4 +1,10 @@
-discord.py[voice]>=2.3,<3
+discord.py[voice]>=2.7,<3
+# DAVE (Discord voice E2EE) implementation used by discord.py. davey 0.2.0 made
+# commits/welcomes require explicit prepare_transition()/execute_transition()
+# calls, which discord.py 2.7.1 never makes: the session never gets an
+# encryption key and the bot "speaks" (green ring) but nobody hears anything.
+# Lift this cap once a discord.py release supports davey 0.2.
+davey>=0.1.6,<0.2
 yt-dlp[default]
 # yt-dlp plugin that fetches PO tokens from the bgutil provider sidecar, keeping
 # YouTube playback working headlessly without cookies (see docker-compose.yml).

@@ -3,6 +3,11 @@
 # copying a static build instead cuts minutes off the build and shrinks the image.
 FROM mwader/static-ffmpeg:7.1 AS ffmpeg
 
+# yt-dlp needs an external JavaScript runtime to solve YouTube's player
+# challenges; without one, YouTube extraction returns no playable audio formats.
+# Deno is yt-dlp's default runtime and is picked up automatically from PATH.
+FROM denoland/deno:bin-2.5.6 AS deno
+
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -17,6 +22,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
+COPY --from=deno /deno /usr/local/bin/deno
 
 WORKDIR /app
 
