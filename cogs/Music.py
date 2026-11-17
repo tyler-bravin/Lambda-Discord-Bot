@@ -21,11 +21,12 @@ import json
 import logging
 import os
 import random
+import shlex
 import time
 import traceback
 import urllib.parse
 from collections import deque
-from typing import Union
+from typing import Optional, Union
 
 import aiosqlite
 import discord
@@ -83,14 +84,55 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.uploader = data.get('uploader')
         self.requester = data.get('requester')
 
+    # Upper bound on the pre-playback wait, so a bogus timestamp can't stall playback.
+    MAX_AVAILABILITY_WAIT = 30
+
     @staticmethod
-    def _ffmpeg_options(seek: int = 0) -> dict:
-        """FFmpeg options, optionally starting playback at a given offset (seconds)."""
+    def _ffmpeg_options(seek: int = 0, headers: Optional[dict] = None) -> dict:
+        """
+        FFmpeg options for a stream, optionally starting at an offset (seconds).
+
+        ``headers`` are the HTTP headers yt-dlp resolved the stream with. YouTube
+        hands out stream URLs for a specific client (e.g. the TV app) and rejects
+        requests with a 403 when they don't carry that client's headers, so FFmpeg
+        must send the same ones instead of its default ``Lavf`` user agent.
+        """
+        before = ffmpeg_options['before_options']
+        if headers:
+            headers = dict(headers)
+            user_agent = headers.pop('User-Agent', None)
+            if user_agent:
+                before += f" -user_agent {shlex.quote(user_agent)}"
+            if headers:
+                blob = ''.join(f"{key}: {value}\r\n" for key, value in headers.items())
+                before += f" -headers {shlex.quote(blob)}"
         if seek and seek > 0:
             # -ss before the input seeks quickly by keyframe.
-            return {**ffmpeg_options,
-                    'before_options': f"{ffmpeg_options['before_options']} -ss {int(seek)}"}
-        return ffmpeg_options
+            before += f" -ss {int(seek)}"
+        return {**ffmpeg_options, 'before_options': before}
+
+    @classmethod
+    async def _wait_until_available(cls, data: dict):
+        """
+        Waits out YouTube's pre-playback period before the stream is opened.
+
+        YouTube stream URLs can carry a required waiting period (yt-dlp exposes it
+        as ``available_at``); opening the URL before then returns 403 Forbidden.
+        yt-dlp's own downloader sleeps for it, but FFmpeg doesn't know about it.
+        """
+        available_at = data.get('available_at')
+        if not available_at:
+            return
+        delay = available_at - time.time()
+        if delay > 0:
+            log.debug("Waiting %.1fs for %r to become available", delay, data.get('title'))
+            await asyncio.sleep(min(delay, cls.MAX_AVAILABILITY_WAIT))
+
+    @classmethod
+    async def _create(cls, filename, data, *, volume, seek):
+        await cls._wait_until_available(data)
+        options = cls._ffmpeg_options(seek, data.get('http_headers'))
+        return cls(discord.FFmpegPCMAudio(filename, **options), data=data, volume=volume)
 
     @classmethod
     async def from_data(cls, data, *, volume=0.5, seek=0):
@@ -98,8 +140,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         Creates a YTDLSource directly from pre-fetched yt-dlp data.
         This is the "fast path" for playback as it avoids blocking network calls.
         """
-        filename = data.get('url')
-        return cls(discord.FFmpegPCMAudio(filename, **cls._ffmpeg_options(seek)), data=data, volume=volume)
+        return await cls._create(data.get('url'), data, volume=volume, seek=seek)
 
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False, requester=None, volume=0.5, seek=0):
@@ -116,7 +157,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         data['requester'] = requester
         filename = data['url'] if stream else create_ytdl().prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **cls._ffmpeg_options(seek)), data=data, volume=volume)
+        return await cls._create(filename, data, volume=volume, seek=seek)
 
 
 # --- Core Music Cog ---

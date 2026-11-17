@@ -798,3 +798,72 @@ async def test_queue_command_with_songs(music_cog, mock_ctx, mock_player):
     mock_ctx.send.assert_awaited_once()
     sent_view = mock_ctx.send.call_args.kwargs.get('view')
     assert isinstance(sent_view, QueuePaginator)
+
+# --- YouTube stream handoff to FFmpeg ---
+
+def test_ffmpeg_options_pass_ytdlp_headers():
+    """FFmpeg must send the headers yt-dlp resolved the stream with, or YouTube 403s."""
+    import shlex
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-us,en;q=0.5',
+    }
+    opts = YTDLSource._ffmpeg_options(0, headers)
+    # discord.py runs before_options through shlex.split; check the round trip.
+    args = shlex.split(opts['before_options'])
+    assert args[args.index('-user_agent') + 1] == headers['User-Agent']
+    assert args[args.index('-headers') + 1] == (
+        "Accept: text/html,application/xhtml+xml\r\nAccept-Language: en-us,en;q=0.5\r\n")
+    assert args[:2] == ['-reconnect', '1']
+    assert '-ss' not in args
+    assert opts['options'] == '-vn'
+
+
+def test_ffmpeg_options_seek_and_no_headers():
+    import shlex
+    args = shlex.split(YTDLSource._ffmpeg_options(90)['before_options'])
+    assert args[-2:] == ['-ss', '90']
+    assert '-headers' not in args and '-user_agent' not in args
+
+
+def test_ffmpeg_options_does_not_mutate_headers():
+    headers = {'User-Agent': 'UA', 'Accept': '*/*'}
+    YTDLSource._ffmpeg_options(0, headers)
+    assert headers == {'User-Agent': 'UA', 'Accept': '*/*'}
+
+
+def _fake_audio(*args, **kwargs):
+    source = MagicMock(spec=discord.AudioSource)
+    source.is_opus.return_value = False
+    return source
+
+
+@pytest.mark.asyncio
+async def test_from_data_waits_for_available_at():
+    """YouTube's pre-playback wait: opening the stream early returns 403."""
+    data = {**full_song_data, 'available_at': time.time() + 4,
+            'http_headers': {'User-Agent': 'UA'}}
+    with patch('cogs.Music.asyncio.sleep', new_callable=AsyncMock) as mock_sleep, \
+            patch('cogs.Music.discord.FFmpegPCMAudio', side_effect=_fake_audio) as mock_ffmpeg:
+        await YTDLSource.from_data(data)
+    delay = mock_sleep.await_args.args[0]
+    assert 3 < delay <= 4
+    assert '-user_agent UA' in mock_ffmpeg.call_args.kwargs['before_options']
+
+
+@pytest.mark.asyncio
+async def test_from_data_skips_wait_when_already_available():
+    data = {**full_song_data, 'available_at': time.time() - 60}
+    with patch('cogs.Music.asyncio.sleep', new_callable=AsyncMock) as mock_sleep, \
+            patch('cogs.Music.discord.FFmpegPCMAudio', side_effect=_fake_audio):
+        await YTDLSource.from_data(data)
+    mock_sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_availability_wait_is_capped():
+    data = {**full_song_data, 'available_at': time.time() + 10_000}
+    with patch('cogs.Music.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+        await YTDLSource._wait_until_available(data)
+    assert mock_sleep.await_args.args[0] == YTDLSource.MAX_AVAILABILITY_WAIT
