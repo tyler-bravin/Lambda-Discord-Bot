@@ -284,11 +284,13 @@ class Music(commands.Cog):
     # --- Internal Helper Methods ---
     def _song_has_fresh_stream(self, song) -> bool:
         """Whether the song's pre-fetched stream URL is still safe to play directly."""
-        return bool(
-            getattr(song, 'stream_url', None)
-            and getattr(song, 'data', None)
-            and (time.time() - getattr(song, 'fetched_at', 0)) < self.STREAM_URL_TTL_SECONDS
-        )
+        if not (getattr(song, 'stream_url', None) and getattr(song, 'data', None)):
+            return False
+        # Direct-file sources (the Juice WRLD API) hand out permanent URLs. The TTL
+        # exists for YouTube's signed links, which expire; it doesn't apply here.
+        if getattr(song, 'permanent_stream', False):
+            return True
+        return (time.time() - getattr(song, 'fetched_at', 0)) < self.STREAM_URL_TTL_SECONDS
 
     async def _refresh_song_data(self, song: Song) -> bool:
         """
@@ -786,9 +788,12 @@ class Music(commands.Cog):
 
         if not song.playback_retried:
             song.playback_retried = True
-            # The stream URL is what failed, so force a fresh extraction.
-            song.stream_url = None
-            song.fetched_at = 0.0
+            if not getattr(song, 'permanent_stream', False):
+                # The stream URL is what failed, so force a fresh extraction. A
+                # permanent URL is kept instead: there is nothing fresher to fetch,
+                # and clearing it would push a direct file link through yt-dlp.
+                song.stream_url = None
+                song.fetched_at = 0.0
             self.queues.setdefault(guild_id, []).insert(0, song)
             await self._announce(ctx, embed=discord.Embed(
                 description=f"⚠️ The stream for **{song.title}** dropped out. Retrying…",
@@ -1441,10 +1446,17 @@ class Music(commands.Cog):
             return False
 
         try:
-            new_source = await YTDLSource.from_url(
-                url, loop=self.bot.loop, stream=True, requester=source.requester,
-                volume=source.volume, seek=seconds,
-                audio_filter=self._filtergraph(guild_id))
+            if seek_url is None and getattr(song, 'permanent_stream', False):
+                # A permanent direct file has nothing to re-extract: relaunching
+                # FFmpeg over the same URL is the whole job.
+                new_source = await YTDLSource.from_data(
+                    song.data, volume=source.volume, seek=seconds,
+                    audio_filter=self._filtergraph(guild_id))
+            else:
+                new_source = await YTDLSource.from_url(
+                    url, loop=self.bot.loop, stream=True, requester=source.requester,
+                    volume=source.volume, seek=seconds,
+                    audio_filter=self._filtergraph(guild_id))
         except Exception:
             log.exception("Could not rebuild the stream for guild %s", guild_id)
             return False
