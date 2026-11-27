@@ -201,6 +201,11 @@ class Music(commands.Cog):
     # How long to wait in the voice thread for FFmpeg's exit status before assuming
     # it is still running (i.e. that we stopped it deliberately). See _playback_failed.
     FFMPEG_EXIT_GRACE_SECONDS = 0.1
+    # How many songs may fail back-to-back before playback stops instead of
+    # advancing. One dud video shouldn't halt the queue, but a systemic failure
+    # (YouTube refusing our IP, a dead network) would otherwise burn through
+    # every song in seconds, retrying and dropping each one in turn.
+    MAX_CONSECUTIVE_FAILURES = 3
 
     # Selectable effects, as FFmpeg filtergraphs applied after the input. Streams
     # are decoded at 48 kHz, which is what the resampling filters key off.
@@ -234,6 +239,7 @@ class Music(commands.Cog):
         self.autoplay_enabled: dict[int, bool] = {}           # guild_id: autoplay related tracks when queue empties
         self.seek_in_progress: set[int] = set()               # guild_ids being seeked (suppress queue advance)
         self.guild_filters: dict[int, str] = {}               # guild_id: AUDIO_FILTERS key (session only)
+        self.playback_failures: dict[int, int] = {}           # guild_id: songs failed back-to-back
 
         # Vote Tracking Dictionaries
         self.skip_votes: dict[int, set[int]] = {}             # guild_id: {user_id, ...}
@@ -518,6 +524,7 @@ class Music(commands.Cog):
         self.autoplay_enabled.pop(guild_id, None)
         self.voice_clients.pop(guild_id, None)
         self.inactive_since.pop(guild_id, None)
+        self.playback_failures.pop(guild_id, None)
         if vc.is_connected():
             await vc.disconnect()
 
@@ -781,6 +788,10 @@ class Music(commands.Cog):
         reported in chat and the song is dropped, so a bad track can't wedge the
         queue. Either way the listener is told what happened instead of the song
         vanishing silently.
+
+        Once ``MAX_CONSECUTIVE_FAILURES`` songs have failed back-to-back the cause
+        is no longer the song, so advancing the queue only destroys it. Playback
+        stops there with the queue intact (see ``_trip_playback_breaker``).
         """
         guild_id = ctx.guild.id
         log.warning("Stream for %r failed in guild %s (retried=%s)",
@@ -795,19 +806,75 @@ class Music(commands.Cog):
                 song.stream_url = None
                 song.fetched_at = 0.0
             self.queues.setdefault(guild_id, []).insert(0, song)
+            await self.save_queue_to_db(guild_id)
             await self._announce(ctx, embed=discord.Embed(
                 description=f"⚠️ The stream for **{song.title}** dropped out. Retrying…",
                 color=discord.Color.orange()))
-        else:
-            await self._announce(ctx, embed=discord.Embed(
-                title="❌ Playback Error",
-                description=f"**{song.title}** keeps failing to stream — the source may be "
-                            "blocked or rate-limiting us. Skipping it.",
-                color=discord.Color.red()))
+            if ctx.guild.voice_client:
+                await self.play_next(ctx)
+            return
 
+        # The retry failed too, so this song is done. It only counts towards the
+        # breaker here: a single song failing twice is still one failure.
+        if await self._breaker_tripped(ctx, song):
+            return
+
+        await self._announce(ctx, embed=discord.Embed(
+            title="❌ Playback Error",
+            description=f"**{song.title}** keeps failing to stream — the source may be "
+                        "blocked or rate-limiting us. Skipping it.",
+            color=discord.Color.red()))
         await self.save_queue_to_db(guild_id)
         if ctx.guild.voice_client:
             await self.play_next(ctx)
+
+    async def _breaker_tripped(self, ctx, song) -> bool:
+        """
+        Counts one song that couldn't be played and trips the breaker at the limit.
+
+        Returns True once playback has been stopped, in which case the caller must
+        not advance the queue.
+        """
+        guild_id = ctx.guild.id
+        failures = self.playback_failures.get(guild_id, 0) + 1
+        self.playback_failures[guild_id] = failures
+        if failures < self.MAX_CONSECUTIVE_FAILURES:
+            return False
+        await self._trip_playback_breaker(ctx, song, failures)
+        return True
+
+    async def _trip_playback_breaker(self, ctx, song, failures: int):
+        """
+        Stops playback after a run of failures, keeping the queue as it was.
+
+        The song that tripped it goes back to the front rather than being dropped:
+        when the cause is upstream the song is probably fine, and the whole point
+        is to stop losing tracks. The counter resets so the next ``!play`` gets a
+        full budget again instead of tripping on its first failure.
+        """
+        guild_id = ctx.guild.id
+        self.playback_failures.pop(guild_id, None)
+        queue = self.queues.setdefault(guild_id, [])
+        queue.insert(0, song)
+        song.playback_retried = False
+        await self.save_queue_to_db(guild_id)
+
+        log.error("Stopping playback in guild %s after %s consecutive stream failures",
+                  guild_id, failures)
+        await self._announce(ctx, embed=discord.Embed(
+            title="⏹️ Playback stopped",
+            description=f"**{failures}** songs in a row failed to stream, so something "
+                        "upstream is refusing us rather than any one track being bad.\n\n"
+                        f"Your queue is untouched — **{len(queue)}** song(s) still in it. "
+                        f"Try `{self.bot.command_prefix}play` again in a few minutes.",
+            color=discord.Color.red()))
+        # The stale 'Now Playing' message and its dead controls go, and the song is
+        # no longer current — it's back at the front of the queue.
+        await self._cleanup_player_message(guild_id)
+        self.current_song.pop(guild_id, None)
+        # Deliberately *not* arming the inactivity timer: _handle_disconnect clears
+        # the queue and saves the empty one, which would bin in two minutes exactly
+        # what this method just preserved. The bot waits in the channel instead.
 
     async def on_song_end(self, ctx, finished_song_data, *, failed=False):
         """
@@ -823,9 +890,13 @@ class Music(commands.Cog):
         if failed and finished_song_data is not None:
             return await self._handle_failed_playback(ctx, finished_song_data)
 
-        # A clean play earns the song a fresh retry budget if it comes round again.
+        # A clean play earns the song a fresh retry budget if it comes round again,
+        # and ends any run of failures — including when the listener skipped it,
+        # since that still proves playback is working. A None song means play_next
+        # gave up before anything played, so it must not clear the run.
         if finished_song_data is not None:
             finished_song_data.playback_retried = False
+            self.playback_failures.pop(guild_id, None)
 
         # Add the finished song to the history deque for the 'previous' command.
         if finished_song_data:
@@ -913,6 +984,8 @@ class Music(commands.Cog):
                 except Exception:
                     log.exception("Failed to resolve %r", next_song.title)
                 if not resolved:
+                    if await self._breaker_tripped(ctx, next_song):
+                        return
                     await self._announce(ctx, embed=discord.Embed(
                         title="❌ Playback Error",
                         description=f"Could not find a playable video for `{next_song.title}`. Skipping.",
@@ -951,6 +1024,8 @@ class Music(commands.Cog):
                         log.exception("Retry with fresh extraction also failed for %r", next_song.title)
 
             if player is None:
+                if await self._breaker_tripped(ctx, next_song):
+                    return
                 await self._announce(ctx, embed=discord.Embed(
                     title="❌ Playback Error",
                     description=f"Could not play `{next_song.title}`.\nIt may be unavailable or restricted.\nSkipping.",
@@ -1737,6 +1812,7 @@ class Music(commands.Cog):
         self.loop_states.pop(guild.id, None)
         # Stop means stop: don't let autoplay resurrect the queue.
         self.autoplay_enabled.pop(guild.id, None)
+        self.playback_failures.pop(guild.id, None)
         await self.save_queue_to_db(guild.id)
         if vc.is_playing() or vc.is_paused():
             vc.stop()
@@ -2005,6 +2081,7 @@ class Music(commands.Cog):
         self.queues[gid] = []
         self.loop_states.pop(gid, None)
         self.autoplay_enabled.pop(gid, None)
+        self.playback_failures.pop(gid, None)
         await self.save_queue_to_db(gid)
         vc = guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
