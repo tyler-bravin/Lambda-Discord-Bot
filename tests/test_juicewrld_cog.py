@@ -284,11 +284,11 @@ async def test_random_can_span_the_whole_catalogue(cog, music, ctx):
 
 
 @pytest.mark.asyncio
-async def test_random_accepts_a_spaced_category(cog, music, ctx):
+async def test_random_normalises_the_category(cog, music, ctx):
     with patch("cogs.JuiceWRLD.api.random_entry", new_callable=AsyncMock,
                return_value=_entry()) as pick:
-        await cog.juice_random.callback(cog, ctx, category="Recording Session")
-    pick.assert_awaited_once_with("recording_session")
+        await cog.juice_random.callback(cog, ctx, category="  Released ")
+    pick.assert_awaited_once_with("released")
 
 
 @pytest.mark.asyncio
@@ -301,11 +301,17 @@ async def test_random_rejects_an_unknown_category(cog, music, ctx):
 
 
 @pytest.mark.asyncio
-async def test_random_rejects_the_unsurfaced_category(cog, music, ctx):
-    """Nothing in it has a file, so a random pick could never succeed."""
+@pytest.mark.parametrize("category", ["unsurfaced", "recording_session", "Recording Session"])
+async def test_random_turns_away_the_categories_with_no_audio(cog, music, ctx, category):
+    """
+    The catalogue documents 523 sessions and 401 unsurfaced songs without serving
+    audio for any of them, so a pick from either could only ever fail.
+    """
     with patch("cogs.JuiceWRLD.api.random_entry", new_callable=AsyncMock) as pick:
-        await cog.juice_random.callback(cog, ctx, category="unsurfaced")
+        await cog.juice_random.callback(cog, ctx, category=category)
+
     pick.assert_not_called()
+    assert "no audio" in _text(ctx)
 
 
 @pytest.mark.asyncio
@@ -326,6 +332,145 @@ async def test_random_requires_a_voice_channel(cog, ctx):
     pick.assert_not_called()
 
 
+# --- Shuffle ---
+
+def _shuffling(*entries):
+    return patch("cogs.JuiceWRLD.api.random_entries", new_callable=AsyncMock,
+                 return_value=list(entries))
+
+
+def _batch(n):
+    return [_entry(f"Track {i}", 1000 + i) for i in range(n)]
+
+
+@pytest.mark.asyncio
+async def test_shuffle_fills_the_queue_with_unreleased_tracks(cog, music, ctx):
+    with _shuffling(*_batch(20)) as pick:
+        await cog.juice_shuffle.callback(cog, ctx)
+
+    pick.assert_awaited_once_with(api.SHUFFLE_DEFAULT, "unreleased")
+    assert len(music.queues[GUILD_ID]) == 20
+    music.save_queue_to_db.assert_awaited_once()
+    music.play_next.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shuffle_takes_a_count(cog, music, ctx):
+    with _shuffling(*_batch(5)) as pick:
+        await cog.juice_shuffle.callback(cog, ctx, count=5)
+
+    pick.assert_awaited_once_with(5, "unreleased")
+    assert len(music.queues[GUILD_ID]) == 5
+
+
+@pytest.mark.asyncio
+async def test_shuffle_can_span_the_whole_catalogue(cog, music, ctx):
+    with _shuffling(*_batch(3)) as pick:
+        await cog.juice_shuffle.callback(cog, ctx, count=3, category="any")
+    pick.assert_awaited_once_with(3, None)
+
+
+@pytest.mark.asyncio
+async def test_shuffle_previews_a_few_and_counts_the_rest(cog, music, ctx):
+    """Naming all fifty would blow past what an embed can show."""
+    with _shuffling(*_batch(20)):
+        await cog.juice_shuffle.callback(cog, ctx)
+
+    shown = _text(ctx)
+    assert "Queued **20** random tracks" in shown
+    assert "`1000`" in shown and "`1004`" in shown
+    assert "`1005`" not in shown
+    assert f"and **{20 - JuiceWRLD.SHUFFLE_PREVIEW}** more" in shown
+
+
+@pytest.mark.asyncio
+async def test_a_small_shuffle_has_nothing_left_over_to_count(cog, music, ctx):
+    with _shuffling(*_batch(3)):
+        await cog.juice_shuffle.callback(cog, ctx, count=3)
+    assert "more." not in _text(ctx)
+
+
+@pytest.mark.asyncio
+async def test_shuffle_refuses_more_than_the_limit(cog, music, ctx):
+    """One request per track, so the ask has to stay bounded."""
+    with _shuffling(*_batch(1)) as pick:
+        await cog.juice_shuffle.callback(cog, ctx, count=api.SHUFFLE_MAX + 1)
+
+    pick.assert_not_called()
+    assert str(api.SHUFFLE_MAX) in _text(ctx)
+
+
+@pytest.mark.asyncio
+async def test_shuffle_refuses_a_nonsense_count(cog, music, ctx):
+    with _shuffling(*_batch(1)) as pick:
+        await cog.juice_shuffle.callback(cog, ctx, count=0)
+    pick.assert_not_called()
+    assert "at least one" in _text(ctx)
+
+
+@pytest.mark.asyncio
+async def test_shuffle_turns_away_a_category_with_no_audio(cog, music, ctx):
+    with _shuffling(*_batch(1)) as pick:
+        await cog.juice_shuffle.callback(cog, ctx, count=5, category="recording_session")
+    pick.assert_not_called()
+    assert "no audio" in _text(ctx)
+
+
+@pytest.mark.asyncio
+async def test_shuffle_reports_an_unreachable_catalogue(cog, music, ctx):
+    with _shuffling():
+        await cog.juice_shuffle.callback(cog, ctx)
+
+    assert "Couldn't reach" in _text(ctx)
+    assert GUILD_ID not in music.queues
+    music.play_next.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shuffle_requires_a_voice_channel(cog, ctx):
+    ctx.author.voice = None
+    with _shuffling(*_batch(5)) as pick:
+        await cog.juice_shuffle.callback(cog, ctx)
+    assert "not in a voice channel" in _text(ctx)
+    pick.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shuffle_connects_when_not_already_in_voice(cog, music, ctx):
+    with _shuffling(*_batch(5)):
+        await cog.juice_shuffle.callback(cog, ctx)
+
+    ctx.author.voice.channel.connect.assert_awaited_once()
+    assert GUILD_ID in music.voice_clients
+
+
+@pytest.mark.asyncio
+async def test_shuffle_appends_without_restarting_playback(cog, music, ctx):
+    """A shuffle mid-song should extend the queue, not interrupt what's playing."""
+    vc = MagicMock()
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    ctx.voice_client = vc
+    music.queues[GUILD_ID] = ["already queued"]
+
+    with _shuffling(*_batch(4)):
+        await cog.juice_shuffle.callback(cog, ctx)
+
+    assert len(music.queues[GUILD_ID]) == 5
+    assert music.queues[GUILD_ID][0] == "already queued"
+    music.play_next.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shuffled_tracks_stream_directly_and_belong_to_the_invoker(cog, music, ctx):
+    with _shuffling(*_batch(3)):
+        await cog.juice_shuffle.callback(cog, ctx, count=3)
+
+    for song in music.queues[GUILD_ID]:
+        assert song.permanent_stream is True
+        assert song.requester_id == ctx.author.id
+
+
 # --- Degraded mode ---
 
 @pytest.mark.asyncio
@@ -333,6 +478,7 @@ async def test_commands_degrade_when_music_is_unavailable(cog, ctx):
     cog.bot.get_cog.return_value = None
 
     for call in (cog.juice.callback(cog, ctx, query="2mininhell"),
-                 cog.juice_random.callback(cog, ctx)):
+                 cog.juice_random.callback(cog, ctx),
+                 cog.juice_shuffle.callback(cog, ctx)):
         await call
         assert "isn't available" in _text(ctx)

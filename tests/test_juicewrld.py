@@ -311,6 +311,137 @@ async def test_random_retries_past_an_entry_with_no_file():
     assert entry and entry["path"] == PATH
 
 
+# --- Batch sampling ---
+
+def _paging_session(total, entries):
+    """
+    A session whose first GET answers the count probe and whose later GETs return
+    single-entry pages, taken from `entries` in turn and then repeated.
+    """
+    calls = []
+
+    async def payload():
+        if not calls:
+            calls.append("count")
+            return {"count": total, "results": entries[:1]}
+        index = (len(calls) - 1) % len(entries)
+        calls.append("page")
+        return {"count": total, "results": [entries[index]]}
+
+    session_cm, session = _session_returning(None)
+    session.get.return_value.__aenter__.return_value.json = AsyncMock(side_effect=payload)
+    return session_cm, session, calls
+
+
+@pytest.mark.asyncio
+async def test_sampling_returns_the_requested_number_of_tracks():
+    entries = [_entry(f"Track {i}", id=i) for i in range(1, 9)]
+    session_cm, _, _ = _paging_session(1533, entries)
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        picked = await api.random_entries(8, "unreleased")
+    assert len(picked) == 8
+
+
+@pytest.mark.asyncio
+async def test_sampling_never_returns_the_same_track_twice():
+    """Distinct offsets should mean distinct tracks, but ids settle it either way."""
+    repeated = [_entry("Same", id=1)] * 4
+    session_cm, _, _ = _paging_session(1533, repeated)
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        picked = await api.random_entries(4, "unreleased")
+    assert len(picked) == 1
+
+
+@pytest.mark.asyncio
+async def test_sampling_skips_entries_with_no_file():
+    entries = [_entry("Playable", id=1), _entry("No file", id=2, path="")]
+    session_cm, _, _ = _paging_session(1533, entries)
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        picked = await api.random_entries(1, "unreleased")
+    assert [entry["name"] for entry in picked] == ["Playable"]
+
+
+@pytest.mark.asyncio
+async def test_sampling_spreads_over_the_whole_category():
+    """
+    One page of 100 entries is ~700KB and lands in a single era, so the picks are
+    drawn from random offsets across the category instead.
+    """
+    entries = [_entry(f"Track {i}", id=i) for i in range(1, 21)]
+    session_cm, session, _ = _paging_session(1533, entries)
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        await api.random_entries(20, "unreleased")
+
+    pages = [call.kwargs["params"].get("page") for call in session.get.call_args_list]
+    offsets = [page for page in pages if page is not None]
+    assert len(offsets) == len(set(offsets))      # drawn without replacement
+    assert all(1 <= page <= 1533 for page in offsets)
+    assert max(offsets) - min(offsets) > 100      # not clustered in one page
+
+
+@pytest.mark.asyncio
+async def test_sampling_caps_the_requests_a_small_ask_can_cost():
+    """A three-track shuffle shouldn't be allowed to make a hundred requests."""
+    session_cm, session, _ = _paging_session(1533, [_entry(path="")])
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        assert await api.random_entries(3, "unreleased") == []
+
+    budget = 3 * api.SAMPLE_BUDGET_PER_TRACK + api.SAMPLE_BUDGET_SLACK
+    # Plus the one count probe.
+    assert session.get.call_count <= budget + 1
+
+
+@pytest.mark.asyncio
+async def test_sampling_is_capped_at_the_shuffle_maximum():
+    entries = [_entry(f"Track {i}", id=i) for i in range(1, api.SHUFFLE_MAX + 20)]
+    session_cm, _, _ = _paging_session(1533, entries)
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        picked = await api.random_entries(999, "unreleased")
+    assert len(picked) == api.SHUFFLE_MAX
+
+
+@pytest.mark.asyncio
+async def test_sampling_asks_for_at_least_one():
+    entries = [_entry(id=1)]
+    session_cm, _, _ = _paging_session(1533, entries)
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        assert len(await api.random_entries(0, "unreleased")) == 1
+
+
+@pytest.mark.asyncio
+async def test_sampling_cannot_exceed_the_category_size():
+    """Offsets are drawn without replacement, so the pool is the hard ceiling."""
+    entries = [_entry(f"Track {i}", id=i) for i in range(1, 6)]
+    session_cm, _, _ = _paging_session(3, entries)
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        picked = await api.random_entries(20, "unreleased")
+    assert 0 < len(picked) <= 3
+
+
+@pytest.mark.asyncio
+async def test_sampling_an_empty_catalogue():
+    session_cm, _ = _session_returning({"count": 0, "results": []})
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", return_value=session_cm):
+        assert await api.random_entries(10) == []
+
+
+@pytest.mark.asyncio
+async def test_sampling_survives_the_api_going_down():
+    with patch("cogs.juicewrld_api.aiohttp.ClientSession", side_effect=OSError("offline")):
+        assert await api.random_entries(10) == []
+
+
+@pytest.mark.asyncio
+async def test_the_categories_with_no_audio_are_known():
+    """
+    523 recording sessions and 401 unsurfaced songs are documented without audio,
+    so neither can be shuffled; the commands check this list before sampling.
+    """
+    assert api.PLAYABLE_CATEGORIES == ("released", "unreleased")
+    assert set(api.NO_AUDIO_CATEGORIES) == {"recording_session", "unsurfaced"}
+    assert set(api.PLAYABLE_CATEGORIES) | set(api.NO_AUDIO_CATEGORIES) == set(api.CATEGORIES)
+
+
 # --- Link resolution ---
 
 @pytest.mark.asyncio

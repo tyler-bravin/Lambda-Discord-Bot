@@ -10,7 +10,7 @@ A comprehensive, multi-purpose Discord bot built with `discord.py`. It features 
 
 ### 🎵 Music System
 - **Wide Source Support**: YouTube and SoundCloud (tracks, playlists and sets), plus Spotify (tracks, playlists, albums) and Apple Music (songs, albums).
-- **Juice WRLD Catalogue**: Search and play the ~2,800-track [Juice WRLD API](https://juicewrldapi.com) catalogue, including the unreleased and recording-session material that isn't on any streaming service.
+- **Juice WRLD Catalogue**: Search, shuffle and play the [Juice WRLD API](https://juicewrldapi.com) catalogue — ~1,500 unreleased tracks that aren't on any streaming service, alongside the official releases.
 - **Persistent Queue**: The music queue is saved to a database, so it survives bot restarts.
 - **Interactive Controls**: A modern UI with buttons for play/pause, skip, stop, previous, and lyrics.
 - **Democratic Controls**: A vote-based system for skipping, stopping, and other actions ensures fair use.
@@ -192,14 +192,19 @@ metadata is stored, so a loaded playlist re-resolves each stream at play time.
 
 ### Juice WRLD Commands
 Searching the [Juice WRLD API](https://juicewrldapi.com) catalogue, which carries the unreleased
-and recording-session material that no streaming service has. Tracks join the normal queue, so
+material that no streaming service has. Tracks join the normal queue, so
 skip, seek, loop, filters and `!save` all work on them.
 
 | Command | Alias | Slash | Description |
 |---|---|---|---|
 | `!juice <name or id>` | `!jw` | ✅ | Queues the best catalogue match, or a specific entry by id. Run bare for catalogue totals. |
 | `!juicesearch <name>` | `!jws` | ✅ | Lists matching entries with their ids. |
-| `!juicerandom [category]` | `!jwr` | ✅ | Queues a random track (`unreleased` by default, or `released`, `recording_session`, `any`). |
+| `!juicerandom [category]` | `!jwr` | ✅ | Queues one random track (`unreleased` by default, or `released`, `any`). |
+| `!juiceshuffle [count] [category]` | `!jwsh` | ✅ | Fills the queue with random tracks (20 by default, 50 max). |
+
+The catalogue's `recording_session` and `unsurfaced` entries are documented in detail —
+stems, engineers, studios — but have no audio file, so only `released` and `unreleased`
+can be played.
 
 A pasted `juicewrldapi.com` link works with `!play` directly.
 
@@ -232,7 +237,7 @@ A pasted `juicewrldapi.com` link works with `!play` directly.
 | **SoundCloud** | Tracks and sets | Streamed directly |
 | **Spotify** | Tracks, albums, **public** playlists | Metadata → plays the matching YouTube video |
 | **Apple Music** | Songs and albums | Metadata → plays the matching YouTube video |
-| **Juice WRLD API** | Released, unreleased and recording-session tracks | Streamed directly as MP3 (no yt-dlp involved) |
+| **Juice WRLD API** | Released and unreleased tracks | Streamed directly as MP3 (no yt-dlp involved) |
 
 Spotify and Apple Music are **DRM-protected**, so their audio can never be streamed by any bot. Lambda reads the track details and plays the matching YouTube video instead — which is why those tracks queue instantly and resolve as they play.
 
