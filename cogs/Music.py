@@ -1155,6 +1155,70 @@ class Music(commands.Cog):
             description=f"↕️ Moved **{song.title}** from **#{position}** to **#{destination}**.",
             color=discord.Color.green()))
 
+    @commands.hybrid_command(name='jump', aliases=['skipto'])
+    async def jump(self, ctx, position: int):
+        """Skips straight to a queue position, dropping everything before it."""
+        guild_id = ctx.guild.id
+        vc = ctx.voice_client
+        if not vc or not vc.is_connected() or not (vc.is_playing() or vc.is_paused()):
+            return await ctx.send(embed=discord.Embed(
+                description="❌ I'm not playing anything to jump from.", color=discord.Color.red()))
+
+        queue = self.queues.get(guild_id)
+        if not queue:
+            return await ctx.send(embed=discord.Embed(
+                description="❌ The queue is empty — there's nowhere to jump to.",
+                color=discord.Color.red()))
+        if not 1 <= position <= len(queue):
+            return await ctx.send(embed=discord.Embed(
+                description=f"❌ Invalid position. Pick a number between 1 and {len(queue)}.",
+                color=discord.Color.red()))
+        if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
+            return await ctx.send(embed=discord.Embed(
+                description="❌ You must be in my voice channel to jump.", color=discord.Color.red()))
+
+        target = queue[position - 1]
+        # Jumping discards the songs in front of the target as well as the one
+        # currently playing, so permission is judged over that whole set.
+        current = self.current_song.get(guild_id)
+        dropped = queue[:position - 1] + ([current] if current else [])
+        owns_all = all(song.requester_id == ctx.author.id for song in dropped)
+
+        if ctx.author.guild_permissions.administrator or owns_all:
+            return await self._apply_jump(ctx, position, target, len(dropped))
+
+        voters = self.skip_votes.setdefault(guild_id, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, ctx.author.id)
+        if status == self.VOTE_ALREADY:
+            return await ctx.send(embed=discord.Embed(
+                description="ℹ️ You have already voted to skip this song.", color=discord.Color.yellow()))
+        if status == self.VOTE_PASSED:
+            self.skip_votes.pop(guild_id, None)
+            return await self._apply_jump(ctx, position, target, len(dropped),
+                                          prefix=f"🗳️ Vote passed! ({votes}/{required_votes}). ")
+        await ctx.send(embed=discord.Embed(
+            description=f"🗳️ Vote to jump added. **{votes}/{required_votes}** votes now.",
+            color=discord.Color.blue()))
+
+    async def _apply_jump(self, ctx, position: int, target, dropped: int, prefix: str = ""):
+        """Drops the queue in front of `position` and skips onto the target song."""
+        guild_id = ctx.guild.id
+        note = ""
+        # Single-song loop would put the current song straight back at the front,
+        # landing the jump on the song it was supposed to leave.
+        if self.loop_states.get(guild_id) == 'song':
+            self.loop_states.pop(guild_id, None)
+            note = "\nLooping this song was turned off so the jump could land."
+
+        del self.queues[guild_id][:position - 1]
+        await self.save_queue_to_db(guild_id)
+        await ctx.send(embed=discord.Embed(
+            description=f"{prefix}⏭️ Jumping to **[{target.title}]({target.url})**, "
+                        f"skipping **{dropped}** song(s).{note}",
+            color=discord.Color.green()))
+        # The after callback then starts whatever is now at the front of the queue.
+        ctx.voice_client.stop()
+
     @commands.hybrid_command(name='volume', aliases=['vol'])
     async def volume(self, ctx, volume: int = None):
         """Sets the player's volume (0-200), saved permanently for the server."""
