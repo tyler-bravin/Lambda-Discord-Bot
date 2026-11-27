@@ -867,3 +867,121 @@ async def test_availability_wait_is_capped():
     with patch('cogs.Music.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
         await YTDLSource._wait_until_available(data)
     assert mock_sleep.await_args.args[0] == YTDLSource.MAX_AVAILABILITY_WAIT
+
+
+# --- Playback failure detection ---
+
+def _exited(code):
+    """A fake YTDLSource whose FFmpeg process has exited with ``code``."""
+    source = MagicMock(spec=YTDLSource)
+    source.ffmpeg_returncode = code
+    return source
+
+
+def test_playback_failed_on_ffmpeg_error_code():
+    # 8 is FFmpeg's HTTP error status, e.g. a 403 from YouTube mid-stream.
+    assert Music._playback_failed(_exited(8)) is True
+
+
+def test_playback_failed_false_on_clean_exit():
+    assert Music._playback_failed(_exited(0)) is False
+
+
+def test_playback_failed_false_when_we_killed_it():
+    # A deliberate skip/stop kills FFmpeg, which reports a negative status.
+    assert Music._playback_failed(_exited(-9)) is False
+
+
+def test_playback_failed_false_while_still_running():
+    # Still running at callback time means we stopped it; cleanup reaps it later.
+    assert Music._playback_failed(_exited(None)) is False
+
+
+def test_playback_failed_false_without_a_player():
+    assert Music._playback_failed(None) is False
+
+
+@pytest.mark.asyncio
+async def test_after_callback_flags_a_broken_stream(music_cog, mock_ctx):
+    """A positive FFmpeg exit status reaches on_song_end as a failure."""
+    song = Song(full_song_data, MagicMock())
+    # The callback hands the coroutine to the bot's loop from the voice thread.
+    music_cog.bot.loop = asyncio.get_running_loop()
+    with patch.object(music_cog, 'on_song_end', new_callable=AsyncMock) as on_end:
+        music_cog._make_after(mock_ctx, song, _exited(8))(None)
+        await asyncio.sleep(0.05)
+        on_end.assert_awaited_once()
+        assert on_end.await_args.kwargs['failed'] is True
+
+
+@pytest.mark.asyncio
+async def test_after_callback_does_not_flag_a_finished_song(music_cog, mock_ctx):
+    song = Song(full_song_data, MagicMock())
+    music_cog.bot.loop = asyncio.get_running_loop()
+    with patch.object(music_cog, 'on_song_end', new_callable=AsyncMock) as on_end:
+        music_cog._make_after(mock_ctx, song, _exited(0))(None)
+        await asyncio.sleep(0.05)
+        assert on_end.await_args.kwargs['failed'] is False
+
+
+@pytest.mark.asyncio
+async def test_failed_playback_retries_the_song_once(music_cog, mock_ctx):
+    """A broken stream is requeued at the front with its stale stream URL cleared."""
+    song = Song(full_song_data, MagicMock())
+    assert song.stream_url  # the fast-path URL that just failed
+    music_cog.queues[mock_ctx.guild.id] = []
+
+    with patch.object(music_cog, 'play_next', new_callable=AsyncMock) as play_next:
+        await music_cog.on_song_end(mock_ctx, song, failed=True)
+
+    assert music_cog.queues[mock_ctx.guild.id] == [song]
+    assert song.playback_retried is True
+    # Cleared so play_next re-extracts instead of reusing the URL that just 403'd.
+    assert song.stream_url is None
+    assert song.fetched_at == 0.0
+    play_next.assert_awaited_once()
+    mock_ctx.channel.send.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_playback_gives_up_after_one_retry(music_cog, mock_ctx):
+    """A second failure reports the problem and drops the song."""
+    song = Song(full_song_data, MagicMock())
+    song.playback_retried = True
+    music_cog.queues[mock_ctx.guild.id] = []
+
+    with patch.object(music_cog, 'play_next', new_callable=AsyncMock) as play_next:
+        await music_cog.on_song_end(mock_ctx, song, failed=True)
+
+    assert music_cog.queues[mock_ctx.guild.id] == []
+    play_next.assert_awaited_once()
+    embed = mock_ctx.channel.send.await_args.kwargs['embed']
+    assert "keeps failing" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_failed_playback_skips_history_and_loop(music_cog, mock_ctx):
+    """A song that never really played isn't looped or added to history."""
+    gid = mock_ctx.guild.id
+    song = Song(full_song_data, MagicMock())
+    song.playback_retried = True  # so it is dropped rather than requeued
+    music_cog.loop_states[gid] = 'queue'
+    music_cog.queues[gid] = []
+
+    with patch.object(music_cog, 'play_next', new_callable=AsyncMock):
+        await music_cog.on_song_end(mock_ctx, song, failed=True)
+
+    assert music_cog.queues[gid] == []
+    assert not music_cog.song_history.get(gid)
+
+
+@pytest.mark.asyncio
+async def test_clean_play_restores_the_retry_budget(music_cog, mock_ctx):
+    """A song that plays through can be retried again if it fails much later."""
+    song = Song(full_song_data, MagicMock())
+    song.playback_retried = True
+    mock_ctx.guild.voice_client = None
+
+    await music_cog.on_song_end(mock_ctx, song, failed=False)
+
+    assert song.playback_retried is False
