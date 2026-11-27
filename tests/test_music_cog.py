@@ -1454,3 +1454,185 @@ async def test_play_next_plays_a_direct_file_without_a_lookup(mock_from_data, mu
     refresh.assert_not_called()
     mock_from_data.assert_awaited_once()
     mock_ctx.guild.voice_client.play.assert_called_once()
+
+
+# --- Playback circuit breaker ---
+
+def _dead_song(title="Dead Song"):
+    """A song whose retry has already been spent, so the next failure is terminal."""
+    song = Song({**full_song_data, 'title': title}, MagicMock())
+    song.playback_retried = True
+    return song
+
+
+async def _fail_terminally(music_cog, ctx, song):
+    with patch.object(music_cog, 'play_next', new_callable=AsyncMock) as play_next:
+        await music_cog.on_song_end(ctx, song, failed=True)
+    return play_next
+
+
+@pytest.mark.asyncio
+async def test_one_bad_song_does_not_stop_the_queue(music_cog, mock_ctx):
+    """A single dud video must still be skipped past, as before."""
+    music_cog.queues[mock_ctx.guild.id] = []
+
+    play_next = await _fail_terminally(music_cog, mock_ctx, _dead_song())
+
+    play_next.assert_awaited_once()
+    assert music_cog.playback_failures[mock_ctx.guild.id] == 1
+    assert music_cog.queues[mock_ctx.guild.id] == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_of_failures_stops_playback_and_keeps_the_queue(music_cog, mock_ctx):
+    """
+    The bug this exists for: every song failing in turn used to be retried, dropped
+    and advanced past, shredding the whole queue in seconds.
+    """
+    guild_id = mock_ctx.guild.id
+    survivors = [Song(playlist_entry_1, MagicMock()), Song(playlist_entry_2, MagicMock())]
+    music_cog.queues[guild_id] = list(survivors)
+
+    for index in range(Music.MAX_CONSECUTIVE_FAILURES):
+        last = _dead_song(f"Dead {index}")
+        play_next = await _fail_terminally(music_cog, mock_ctx, last)
+
+    # The queue is not advanced past the failure that tripped it.
+    play_next.assert_not_awaited()
+    # And nothing was lost: the tripping song is back at the front.
+    assert music_cog.queues[guild_id][0] is last
+    assert music_cog.queues[guild_id][1:] == survivors
+
+
+@pytest.mark.asyncio
+async def test_the_tripping_song_gets_its_retry_budget_back(music_cog, mock_ctx):
+    """It is probably fine — the cause was upstream — so it must be playable again."""
+    music_cog.queues[mock_ctx.guild.id] = []
+    for index in range(Music.MAX_CONSECUTIVE_FAILURES):
+        last = _dead_song(f"Dead {index}")
+        await _fail_terminally(music_cog, mock_ctx, last)
+
+    assert last.playback_retried is False
+
+
+@pytest.mark.asyncio
+async def test_tripping_explains_itself_in_the_channel(music_cog, mock_ctx):
+    music_cog.queues[mock_ctx.guild.id] = [Song(playlist_entry_1, MagicMock())]
+    for index in range(Music.MAX_CONSECUTIVE_FAILURES):
+        await _fail_terminally(music_cog, mock_ctx, _dead_song(f"Dead {index}"))
+
+    embed = mock_ctx.channel.send.await_args.kwargs['embed']
+    assert "in a row" in embed.description
+    assert "queue is untouched" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_tripping_does_not_arm_the_inactivity_timer(music_cog, mock_ctx):
+    """
+    _handle_disconnect clears the queue and saves the empty one, so arming the
+    timer would bin in two minutes exactly what the breaker just preserved.
+    """
+    music_cog.queues[mock_ctx.guild.id] = [Song(playlist_entry_1, MagicMock())]
+    for index in range(Music.MAX_CONSECUTIVE_FAILURES):
+        await _fail_terminally(music_cog, mock_ctx, _dead_song(f"Dead {index}"))
+
+    assert mock_ctx.guild.id not in music_cog.inactive_since
+
+
+@pytest.mark.asyncio
+async def test_the_counter_resets_once_tripped(music_cog, mock_ctx):
+    """So the next !play gets a full budget instead of tripping on one failure."""
+    music_cog.queues[mock_ctx.guild.id] = []
+    for index in range(Music.MAX_CONSECUTIVE_FAILURES):
+        await _fail_terminally(music_cog, mock_ctx, _dead_song(f"Dead {index}"))
+
+    assert mock_ctx.guild.id not in music_cog.playback_failures
+
+    # One failure after the trip is treated as isolated again, not as the next strike.
+    play_next = await _fail_terminally(music_cog, mock_ctx, _dead_song("After"))
+    play_next.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_song_that_plays_clears_the_run(music_cog, mock_ctx):
+    guild_id = mock_ctx.guild.id
+    music_cog.playback_failures[guild_id] = Music.MAX_CONSECUTIVE_FAILURES - 1
+    music_cog.queues[guild_id] = []
+
+    with patch.object(music_cog, 'play_next', new_callable=AsyncMock):
+        await music_cog.on_song_end(mock_ctx, Song(full_song_data, MagicMock()))
+
+    assert guild_id not in music_cog.playback_failures
+
+
+@pytest.mark.asyncio
+async def test_giving_up_before_anything_played_does_not_clear_the_run(music_cog, mock_ctx):
+    """
+    play_next calls on_song_end(ctx, None) when it can't build a player at all.
+    Treating that as a clean play would reset the counter on every strike and the
+    breaker could never trip.
+    """
+    guild_id = mock_ctx.guild.id
+    music_cog.playback_failures[guild_id] = 2
+    music_cog.queues[guild_id] = []
+
+    with patch.object(music_cog, 'play_next', new_callable=AsyncMock):
+        await music_cog.on_song_end(mock_ctx, None)
+
+    assert music_cog.playback_failures[guild_id] == 2
+
+
+@pytest.mark.asyncio
+@patch('cogs.Music.YTDLSource.from_data', new_callable=AsyncMock)
+@patch('cogs.Music.YTDLSource.from_url', new_callable=AsyncMock)
+async def test_a_player_that_cannot_be_built_counts_towards_the_breaker(
+        mock_from_url, mock_from_data, music_cog, mock_ctx):
+    """Extraction failing for every song is the same systemic problem as a 403 storm."""
+    guild_id = mock_ctx.guild.id
+    mock_from_url.side_effect = Exception("extraction failed")
+    mock_from_data.side_effect = Exception("extraction failed")
+    mock_ctx.guild.voice_client = MagicMock()
+    mock_ctx.guild.voice_client.is_connected.return_value = True
+
+    music_cog.playback_failures[guild_id] = Music.MAX_CONSECUTIVE_FAILURES - 1
+    song = Song(full_song_data, MagicMock())
+    music_cog.queues[guild_id] = [song]
+
+    with patch.object(music_cog, 'on_song_end', new_callable=AsyncMock) as on_end:
+        await music_cog.play_next(mock_ctx)
+
+    # Tripped instead of advancing, and the song is back in the queue.
+    on_end.assert_not_awaited()
+    assert music_cog.queues[guild_id] == [song]
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_placeholder_counts_towards_the_breaker(music_cog, mock_ctx):
+    guild_id = mock_ctx.guild.id
+    mock_ctx.guild.voice_client = MagicMock()
+    mock_ctx.guild.voice_client.is_connected.return_value = True
+
+    music_cog.playback_failures[guild_id] = Music.MAX_CONSECUTIVE_FAILURES - 1
+    placeholder = Song.from_search("Some Track", "Some Artist", MagicMock())
+    music_cog.queues[guild_id] = [placeholder]
+
+    with patch.object(music_cog, '_refresh_song_data', new_callable=AsyncMock,
+                      return_value=False), \
+         patch.object(music_cog, 'on_song_end', new_callable=AsyncMock) as on_end:
+        await music_cog.play_next(mock_ctx)
+
+    on_end.assert_not_awaited()
+    assert music_cog.queues[guild_id] == [placeholder]
+
+
+@pytest.mark.asyncio
+async def test_disconnecting_clears_the_run(music_cog, mock_ctx):
+    guild_id = mock_ctx.guild.id
+    music_cog.playback_failures[guild_id] = 2
+    vc = MagicMock()
+    vc.guild.id = guild_id
+    vc.is_connected.return_value = False
+
+    await music_cog._handle_disconnect(vc)
+
+    assert guild_id not in music_cog.playback_failures
