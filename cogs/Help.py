@@ -15,9 +15,10 @@ class Help(commands.Cog):
     """Hosts the custom help command."""
 
     # Order and emoji used to present each cog's commands in the overview.
-    COG_ORDER = ["Music", "Playlists", "TaskBoard", "Admin", "Backup", "Help"]
+    COG_ORDER = ["Music", "Playlists", "JuiceWRLD", "TaskBoard", "Admin", "Backup", "Help"]
     COG_EMOJI = {"Music": "🎵", "TaskBoard": "✅", "Admin": "🛠️",
-                 "Backup": "💾", "Help": "❓", "Playlists": "📀"}
+                 "Backup": "💾", "Help": "❓", "Playlists": "📀",
+                 "JuiceWRLD": "🧃"}
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot

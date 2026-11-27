@@ -1334,3 +1334,123 @@ async def test_lyrics_treats_an_empty_body_as_no_match(music_cog, mock_ctx):
         await music_cog.lyrics.callback(music_cog, mock_ctx, query="song")
 
     assert "No lyrics found" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+# --- Permanent direct streams (the Juice WRLD API) ---
+
+def _direct_song(requester=None):
+    """A song whose stream is a plain file on a URL that never expires."""
+    requester = requester or MagicMock()
+    return Song({
+        'webpage_url': 'https://juicewrldapi.com/juicewrld/files/download/?path=a.mp3',
+        'url': 'https://juicewrldapi.com/juicewrld/files/download/?path=a.mp3',
+        'title': '2MININHELL',
+        'duration': 222,
+        'permanent_stream': True,
+        'requester': requester,
+    }, requester)
+
+
+def test_a_permanent_stream_never_goes_stale(music_cog):
+    """The TTL exists for YouTube's signed URLs; a plain file link doesn't expire."""
+    song = _direct_song()
+    song.fetched_at = time.time() - (music_cog.STREAM_URL_TTL_SECONDS * 10)
+    assert music_cog._song_has_fresh_stream(song) is True
+
+
+def test_an_expiring_stream_still_goes_stale(music_cog):
+    song = Song(full_song_data, MagicMock())
+    song.fetched_at = time.time() - (music_cog.STREAM_URL_TTL_SECONDS + 1)
+    assert music_cog._song_has_fresh_stream(song) is False
+
+
+def test_a_song_with_no_stream_is_never_fresh(music_cog):
+    song = _direct_song()
+    song.stream_url = None
+    assert music_cog._song_has_fresh_stream(song) is False
+
+
+@pytest.mark.asyncio
+async def test_retrying_a_direct_file_keeps_its_url(music_cog, mock_ctx):
+    """
+    There is nothing fresher to fetch for a permanent URL, and clearing it would
+    push a direct file link through yt-dlp.
+    """
+    song = _direct_song()
+    original = song.stream_url
+    music_cog.queues[mock_ctx.guild.id] = []
+
+    with patch.object(music_cog, 'play_next', new_callable=AsyncMock):
+        await music_cog.on_song_end(mock_ctx, song, failed=True)
+
+    assert music_cog.queues[mock_ctx.guild.id] == [song]
+    assert song.playback_retried is True
+    assert song.stream_url == original
+
+
+@pytest.mark.asyncio
+async def test_a_direct_file_is_dropped_after_a_second_failure(music_cog, mock_ctx):
+    song = _direct_song()
+    song.playback_retried = True
+    music_cog.queues[mock_ctx.guild.id] = []
+
+    with patch.object(music_cog, 'play_next', new_callable=AsyncMock):
+        await music_cog.on_song_end(mock_ctx, song, failed=True)
+
+    assert music_cog.queues[mock_ctx.guild.id] == []
+
+
+@pytest.mark.asyncio
+@patch('cogs.Music.YTDLSource.from_url', new_callable=AsyncMock)
+@patch('cogs.Music.YTDLSource.from_data', new_callable=AsyncMock)
+async def test_seeking_a_direct_file_skips_yt_dlp(mock_from_data, mock_from_url,
+                                                  music_cog, mock_ctx, mock_player):
+    """Relaunching FFmpeg over the same URL is the whole job — there is no page to re-extract."""
+    song = _direct_song()
+    music_cog.current_song[mock_ctx.guild.id] = song
+    mock_ctx.voice_client = MagicMock()
+    mock_ctx.voice_client.source = mock_player
+    mock_from_data.return_value = mock_player
+
+    assert await music_cog._restart_at(mock_ctx, 30) is True
+
+    mock_from_url.assert_not_called()
+    assert mock_from_data.await_args.args[0] is song.data
+    assert mock_from_data.await_args.kwargs['seek'] == 30
+
+
+@pytest.mark.asyncio
+@patch('cogs.Music.YTDLSource.from_url', new_callable=AsyncMock)
+@patch('cogs.Music.YTDLSource.from_data', new_callable=AsyncMock)
+async def test_seeking_a_youtube_song_still_re_extracts(mock_from_data, mock_from_url,
+                                                        music_cog, mock_ctx, mock_player):
+    song = Song(full_song_data, MagicMock())
+    music_cog.current_song[mock_ctx.guild.id] = song
+    mock_ctx.voice_client = MagicMock()
+    mock_ctx.voice_client.source = mock_player
+    mock_from_url.return_value = mock_player
+
+    assert await music_cog._restart_at(mock_ctx, 30) is True
+
+    mock_from_data.assert_not_called()
+    mock_from_url.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@patch('cogs.Music.YTDLSource.from_data', new_callable=AsyncMock)
+async def test_play_next_plays_a_direct_file_without_a_lookup(mock_from_data, music_cog,
+                                                              mock_ctx, mock_player):
+    """The whole point of the direct source: queue to audio with no extraction."""
+    song = _direct_song(mock_ctx.author)
+    song.fetched_at = 0.0  # as it comes back from the database
+    music_cog.queues[mock_ctx.guild.id] = [song]
+    mock_ctx.guild.voice_client = MagicMock()
+    mock_ctx.guild.voice_client.is_connected.return_value = True
+    mock_from_data.return_value = mock_player
+
+    with patch.object(music_cog, '_refresh_song_data', new_callable=AsyncMock) as refresh:
+        await music_cog.play_next(mock_ctx)
+
+    refresh.assert_not_called()
+    mock_from_data.assert_awaited_once()
+    mock_ctx.guild.voice_client.play.assert_called_once()

@@ -10,6 +10,7 @@ A comprehensive, multi-purpose Discord bot built with `discord.py`. It features 
 
 ### 🎵 Music System
 - **Wide Source Support**: YouTube and SoundCloud (tracks, playlists and sets), plus Spotify (tracks, playlists, albums) and Apple Music (songs, albums).
+- **Juice WRLD Catalogue**: Search and play the ~2,800-track [Juice WRLD API](https://juicewrldapi.com) catalogue, including the unreleased and recording-session material that isn't on any streaming service.
 - **Persistent Queue**: The music queue is saved to a database, so it survives bot restarts.
 - **Interactive Controls**: A modern UI with buttons for play/pause, skip, stop, previous, and lyrics.
 - **Democratic Controls**: A vote-based system for skipping, stopping, and other actions ensures fair use.
@@ -130,6 +131,7 @@ docker compose up -d --build
 | `YTDLP_COOKIES` | | `$DATA_DIR/cookies.txt` | Explicit path to a Netscape-format YouTube cookies file. |
 | `YTDLP_COOKIES_FROM_BROWSER` | | — | Read cookies from a local browser profile, e.g. `chrome` or `firefox:ProfileName`. Only for running the bot **outside** Docker, on a machine with a logged-in browser. |
 | `POT_PROVIDER_URL` | | — (set in compose) | URL of the bgutil PO token provider sidecar. |
+| `JUICEWRLD_API_BASE` | | `https://juicewrldapi.com` | Base URL of the Juice WRLD API, for pointing at a mirror. |
 
 ### How yt-dlp is kept working 24/7
 YouTube frequently changes its player in ways that break older yt-dlp releases, so the bot:
@@ -188,6 +190,19 @@ Most commands work both as prefix commands (`!play`) **and** as slash commands (
 Playlists are per-server, capped at 25 per server and 500 tracks each. Only track
 metadata is stored, so a loaded playlist re-resolves each stream at play time.
 
+### Juice WRLD Commands
+Searching the [Juice WRLD API](https://juicewrldapi.com) catalogue, which carries the unreleased
+and recording-session material that no streaming service has. Tracks join the normal queue, so
+skip, seek, loop, filters and `!save` all work on them.
+
+| Command | Alias | Slash | Description |
+|---|---|---|---|
+| `!juice <name or id>` | `!jw` | ✅ | Queues the best catalogue match, or a specific entry by id. Run bare for catalogue totals. |
+| `!juicesearch <name>` | `!jws` | ✅ | Lists matching entries with their ids. |
+| `!juicerandom [category]` | `!jwr` | ✅ | Queues a random track (`unreleased` by default, or `released`, `recording_session`, `any`). |
+
+A pasted `juicewrldapi.com` link works with `!play` directly.
+
 ### TaskBoard Commands
 | Command | Slash | Description |
 |---|---|---|
@@ -217,6 +232,7 @@ metadata is stored, so a loaded playlist re-resolves each stream at play time.
 | **SoundCloud** | Tracks and sets | Streamed directly |
 | **Spotify** | Tracks, albums, **public** playlists | Metadata → plays the matching YouTube video |
 | **Apple Music** | Songs and albums | Metadata → plays the matching YouTube video |
+| **Juice WRLD API** | Released, unreleased and recording-session tracks | Streamed directly as MP3 (no yt-dlp involved) |
 
 Spotify and Apple Music are **DRM-protected**, so their audio can never be streamed by any bot. Lambda reads the track details and plays the matching YouTube video instead — which is why those tracks queue instantly and resolve as they play.
 
