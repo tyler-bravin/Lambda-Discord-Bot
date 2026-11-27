@@ -142,6 +142,16 @@ YouTube frequently changes its player in ways that break older yt-dlp releases, 
 
 A Docker `HEALTHCHECK` also reports the container unhealthy if the bot loses its Discord connection for more than ~90 seconds.
 
+### When streams fail anyway
+A broken stream is detected from FFmpeg's exit status and retried once from a fresh
+extraction, which recovers the usual cause — an expired or rejected stream URL.
+
+If **3 songs fail back-to-back**, the cause isn't the songs, so playback stops instead
+of advancing. The queue is left exactly as it was (including the song that tripped it)
+and the channel is told why. Without this, a systemic failure such as YouTube refusing
+the host's IP would retry and discard every track in turn, emptying the queue in
+seconds. Playing anything successfully clears the count.
+
 ### YouTube cookies: set up once, never touch again
 With the PO token provider, cookies are only needed for age-restricted or private videos. If you do want them, export them **once** the way the yt-dlp wiki recommends, and the bot keeps them fresh from then on:
 
