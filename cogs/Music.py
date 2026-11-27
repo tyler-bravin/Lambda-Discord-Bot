@@ -87,6 +87,22 @@ class YTDLSource(discord.PCMVolumeTransformer):
     # Upper bound on the pre-playback wait, so a bogus timestamp can't stall playback.
     MAX_AVAILABILITY_WAIT = 30
 
+    @property
+    def ffmpeg_returncode(self) -> Optional[int]:
+        """
+        FFmpeg's exit status, or ``None`` while it is still running.
+
+        ``Popen.returncode`` stays ``None`` until the process is reaped, so this
+        polls rather than reading the attribute directly.
+        """
+        process = getattr(self.original, '_process', None)
+        if process is None:
+            return None
+        try:
+            return process.poll()
+        except Exception:  # pragma: no cover - the process was already cleaned up
+            return None
+
     @staticmethod
     def _ffmpeg_options(seek: int = 0, headers: Optional[dict] = None) -> dict:
         """
@@ -171,6 +187,9 @@ class Music(commands.Cog):
     STREAM_URL_TTL_SECONDS = 3600
     # How long a cached "search text -> video" mapping stays valid.
     SEARCH_CACHE_TTL_SECONDS = 7 * 24 * 3600
+    # How long to wait in the voice thread for FFmpeg's exit status before assuming
+    # it is still running (i.e. that we stopped it deliberately). See _playback_failed.
+    FFMPEG_EXIT_GRACE_SECONDS = 0.1
 
     def __init__(self, bot):
         self.bot = bot
@@ -659,13 +678,44 @@ class Music(commands.Cog):
             await self.play_next(ResumeContext(guild, text_channel))
 
     # --- Core Playback Engine ---
-    def _make_after(self, ctx, song):
+    @classmethod
+    def _playback_failed(cls, player) -> bool:
+        """
+        Whether FFmpeg stopped because the stream broke rather than because we stopped it.
+
+        FFmpeg's exit status is the only dependable signal here: discord.py reports
+        no error when the process dies mid-stream, so a 403 from YouTube looks
+        exactly like a song ending and the queue advances in silence. ``0`` means
+        the stream played out, a negative code means we killed it (skip, stop and
+        seek terminate the process), and a positive code is a real failure — ``8``
+        is an HTTP error such as 403 Forbidden.
+
+        On a natural end FFmpeg has normally exited by the time its stdout hits
+        EOF, but it is given a moment to be reaped so a genuine failure isn't
+        misread as "still running". A code we stopped ourselves is never reaped
+        this early, so an intentional skip falls through the wait immediately.
+        """
+        if player is None:
+            return False
+        deadline = time.monotonic() + cls.FFMPEG_EXIT_GRACE_SECONDS
+        while True:
+            code = getattr(player, 'ffmpeg_returncode', None)
+            if code is not None:
+                return code > 0
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    def _make_after(self, ctx, song, player=None):
         """
         Builds the ``after`` callback that advances the queue when a song ends.
 
         Runs in the voice thread, so it schedules onto the event loop. If a seek
         is in progress for the guild it does nothing — seeking stops the player to
         swap in a new source and must not advance the queue.
+
+        ``player`` is the source being played, used to tell a broken stream apart
+        from a song that simply finished.
         """
         guild_id = ctx.guild.id
 
@@ -684,18 +734,64 @@ class Music(commands.Cog):
             if guild_id in self.seek_in_progress:
                 self.seek_in_progress.discard(guild_id)
                 return
-            future = asyncio.run_coroutine_threadsafe(self.on_song_end(ctx, song), self.bot.loop)
+            failed = error is not None or self._playback_failed(player)
+            future = asyncio.run_coroutine_threadsafe(
+                self.on_song_end(ctx, song, failed=failed), self.bot.loop)
             future.add_done_callback(report)
 
         return after_playback
 
-    async def on_song_end(self, ctx, finished_song_data):
+    async def _handle_failed_playback(self, ctx, song):
+        """
+        Reacts to a stream that died part-way through.
+
+        The first failure is retried once from a fresh extraction, which recovers
+        the common case: an expired or IP-rejected stream URL. A second failure is
+        reported in chat and the song is dropped, so a bad track can't wedge the
+        queue. Either way the listener is told what happened instead of the song
+        vanishing silently.
+        """
+        guild_id = ctx.guild.id
+        log.warning("Stream for %r failed in guild %s (retried=%s)",
+                    song.title, guild_id, song.playback_retried)
+
+        if not song.playback_retried:
+            song.playback_retried = True
+            # The stream URL is what failed, so force a fresh extraction.
+            song.stream_url = None
+            song.fetched_at = 0.0
+            self.queues.setdefault(guild_id, []).insert(0, song)
+            await self._announce(ctx, embed=discord.Embed(
+                description=f"⚠️ The stream for **{song.title}** dropped out. Retrying…",
+                color=discord.Color.orange()))
+        else:
+            await self._announce(ctx, embed=discord.Embed(
+                title="❌ Playback Error",
+                description=f"**{song.title}** keeps failing to stream — the source may be "
+                            "blocked or rate-limiting us. Skipping it.",
+                color=discord.Color.red()))
+
+        await self.save_queue_to_db(guild_id)
+        if ctx.guild.voice_client:
+            await self.play_next(ctx)
+
+    async def on_song_end(self, ctx, finished_song_data, *, failed=False):
         """
         Callback function that is executed automatically after a song finishes playing.
         This handles looping logic and triggers the next song in the queue.
+
+        ``failed`` marks a song whose stream broke rather than finished. Such a
+        song never reaches the history or the loop queue — it didn't really play.
         """
         guild_id = ctx.guild.id
         loop_state = self.loop_states.get(guild_id, 'off')
+
+        if failed and finished_song_data is not None:
+            return await self._handle_failed_playback(ctx, finished_song_data)
+
+        # A clean play earns the song a fresh retry budget if it comes round again.
+        if finished_song_data is not None:
+            finished_song_data.playback_retried = False
 
         # Add the finished song to the history deque for the 'previous' command.
         if finished_song_data:
@@ -823,7 +919,7 @@ class Music(commands.Cog):
                 return await self.on_song_end(ctx, None)
 
             try:
-                vc.play(player, after=self._make_after(ctx, next_song))
+                vc.play(player, after=self._make_after(ctx, next_song, player))
             except discord.ClientException:
                 # This can happen if the bot disconnects while trying to play.
                 return
@@ -1157,7 +1253,7 @@ class Music(commands.Cog):
         self.seek_in_progress.add(ctx.guild.id)
         vc.stop()
         try:
-            vc.play(new_source, after=self._make_after(ctx, song))
+            vc.play(new_source, after=self._make_after(ctx, song, new_source))
         except discord.ClientException:
             self.seek_in_progress.discard(ctx.guild.id)
             return await ctx.send(embed=discord.Embed(description="❌ Could not resume after seeking.", color=discord.Color.red()))
