@@ -45,6 +45,7 @@ from cogs.sources import (
     resolve_query,
     upgrade_ytdlp_blocking,
 )
+from cogs.lyrics import fetch_lyrics, strip_timestamps
 from cogs.views import LoopControlsView, PlayerControls, QueuePaginator
 
 log = logging.getLogger(__name__)
@@ -87,8 +88,25 @@ class YTDLSource(discord.PCMVolumeTransformer):
     # Upper bound on the pre-playback wait, so a bogus timestamp can't stall playback.
     MAX_AVAILABILITY_WAIT = 30
 
+    @property
+    def ffmpeg_returncode(self) -> Optional[int]:
+        """
+        FFmpeg's exit status, or ``None`` while it is still running.
+
+        ``Popen.returncode`` stays ``None`` until the process is reaped, so this
+        polls rather than reading the attribute directly.
+        """
+        process = getattr(self.original, '_process', None)
+        if process is None:
+            return None
+        try:
+            return process.poll()
+        except Exception:  # pragma: no cover - the process was already cleaned up
+            return None
+
     @staticmethod
-    def _ffmpeg_options(seek: int = 0, headers: Optional[dict] = None) -> dict:
+    def _ffmpeg_options(seek: int = 0, headers: Optional[dict] = None,
+                        audio_filter: Optional[str] = None) -> dict:
         """
         FFmpeg options for a stream, optionally starting at an offset (seconds).
 
@@ -96,6 +114,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
         hands out stream URLs for a specific client (e.g. the TV app) and rejects
         requests with a 403 when they don't carry that client's headers, so FFmpeg
         must send the same ones instead of its default ``Lavf`` user agent.
+
+        ``audio_filter`` is an FFmpeg filtergraph (see Music.AUDIO_FILTERS). It
+        belongs after the input, unlike the reconnect and seek arguments.
         """
         before = ffmpeg_options['before_options']
         if headers:
@@ -109,7 +130,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
         if seek and seek > 0:
             # -ss before the input seeks quickly by keyframe.
             before += f" -ss {int(seek)}"
-        return {**ffmpeg_options, 'before_options': before}
+        options = ffmpeg_options['options']
+        if audio_filter:
+            options += f" -af {shlex.quote(audio_filter)}"
+        return {**ffmpeg_options, 'before_options': before, 'options': options}
 
     @classmethod
     async def _wait_until_available(cls, data: dict):
@@ -129,21 +153,23 @@ class YTDLSource(discord.PCMVolumeTransformer):
             await asyncio.sleep(min(delay, cls.MAX_AVAILABILITY_WAIT))
 
     @classmethod
-    async def _create(cls, filename, data, *, volume, seek):
+    async def _create(cls, filename, data, *, volume, seek, audio_filter=None):
         await cls._wait_until_available(data)
-        options = cls._ffmpeg_options(seek, data.get('http_headers'))
+        options = cls._ffmpeg_options(seek, data.get('http_headers'), audio_filter)
         return cls(discord.FFmpegPCMAudio(filename, **options), data=data, volume=volume)
 
     @classmethod
-    async def from_data(cls, data, *, volume=0.5, seek=0):
+    async def from_data(cls, data, *, volume=0.5, seek=0, audio_filter=None):
         """
         Creates a YTDLSource directly from pre-fetched yt-dlp data.
         This is the "fast path" for playback as it avoids blocking network calls.
         """
-        return await cls._create(data.get('url'), data, volume=volume, seek=seek)
+        return await cls._create(data.get('url'), data, volume=volume, seek=seek,
+                                 audio_filter=audio_filter)
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False, requester=None, volume=0.5, seek=0):
+    async def from_url(cls, url, *, loop=None, stream=False, requester=None, volume=0.5, seek=0,
+                       audio_filter=None):
         """
         Creates a YTDLSource by fetching info from a URL.
         The blocking `extract_info` call runs in an executor to avoid stalling the
@@ -157,7 +183,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         data['requester'] = requester
         filename = data['url'] if stream else create_ytdl().prepare_filename(data)
-        return await cls._create(filename, data, volume=volume, seek=seek)
+        return await cls._create(filename, data, volume=volume, seek=seek,
+                                 audio_filter=audio_filter)
 
 
 # --- Core Music Cog ---
@@ -171,6 +198,26 @@ class Music(commands.Cog):
     STREAM_URL_TTL_SECONDS = 3600
     # How long a cached "search text -> video" mapping stays valid.
     SEARCH_CACHE_TTL_SECONDS = 7 * 24 * 3600
+    # How long to wait in the voice thread for FFmpeg's exit status before assuming
+    # it is still running (i.e. that we stopped it deliberately). See _playback_failed.
+    FFMPEG_EXIT_GRACE_SECONDS = 0.1
+
+    # Selectable effects, as FFmpeg filtergraphs applied after the input. Streams
+    # are decoded at 48 kHz, which is what the resampling filters key off.
+    # Deliberately not persisted: an effect is a "right now" choice, so a restart
+    # putting playback back to normal is the safer default.
+    # Discord caps an embed description at 4096 characters; leave room for the
+    # title and footer rather than sitting exactly on the limit.
+    LYRICS_EMBED_LIMIT = 3900
+
+    AUDIO_FILTERS = {
+        'none': None,
+        'bassboost': 'bass=g=12',
+        'nightcore': 'asetrate=48000*1.25,aresample=48000',
+        'slowed': 'asetrate=48000*0.85,aresample=48000',
+        'vocals': 'treble=g=4,bass=g=-4',
+        '8d': 'apulsator=hz=0.09',
+    }
 
     def __init__(self, bot):
         self.bot = bot
@@ -186,6 +233,7 @@ class Music(commands.Cog):
         self.current_song: dict[int, Song] = {}               # guild_id: currently playing Song
         self.autoplay_enabled: dict[int, bool] = {}           # guild_id: autoplay related tracks when queue empties
         self.seek_in_progress: set[int] = set()               # guild_ids being seeked (suppress queue advance)
+        self.guild_filters: dict[int, str] = {}               # guild_id: AUDIO_FILTERS key (session only)
 
         # Vote Tracking Dictionaries
         self.skip_votes: dict[int, set[int]] = {}             # guild_id: {user_id, ...}
@@ -659,13 +707,44 @@ class Music(commands.Cog):
             await self.play_next(ResumeContext(guild, text_channel))
 
     # --- Core Playback Engine ---
-    def _make_after(self, ctx, song):
+    @classmethod
+    def _playback_failed(cls, player) -> bool:
+        """
+        Whether FFmpeg stopped because the stream broke rather than because we stopped it.
+
+        FFmpeg's exit status is the only dependable signal here: discord.py reports
+        no error when the process dies mid-stream, so a 403 from YouTube looks
+        exactly like a song ending and the queue advances in silence. ``0`` means
+        the stream played out, a negative code means we killed it (skip, stop and
+        seek terminate the process), and a positive code is a real failure — ``8``
+        is an HTTP error such as 403 Forbidden.
+
+        On a natural end FFmpeg has normally exited by the time its stdout hits
+        EOF, but it is given a moment to be reaped so a genuine failure isn't
+        misread as "still running". A code we stopped ourselves is never reaped
+        this early, so an intentional skip falls through the wait immediately.
+        """
+        if player is None:
+            return False
+        deadline = time.monotonic() + cls.FFMPEG_EXIT_GRACE_SECONDS
+        while True:
+            code = getattr(player, 'ffmpeg_returncode', None)
+            if code is not None:
+                return code > 0
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    def _make_after(self, ctx, song, player=None):
         """
         Builds the ``after`` callback that advances the queue when a song ends.
 
         Runs in the voice thread, so it schedules onto the event loop. If a seek
         is in progress for the guild it does nothing — seeking stops the player to
         swap in a new source and must not advance the queue.
+
+        ``player`` is the source being played, used to tell a broken stream apart
+        from a song that simply finished.
         """
         guild_id = ctx.guild.id
 
@@ -684,18 +763,64 @@ class Music(commands.Cog):
             if guild_id in self.seek_in_progress:
                 self.seek_in_progress.discard(guild_id)
                 return
-            future = asyncio.run_coroutine_threadsafe(self.on_song_end(ctx, song), self.bot.loop)
+            failed = error is not None or self._playback_failed(player)
+            future = asyncio.run_coroutine_threadsafe(
+                self.on_song_end(ctx, song, failed=failed), self.bot.loop)
             future.add_done_callback(report)
 
         return after_playback
 
-    async def on_song_end(self, ctx, finished_song_data):
+    async def _handle_failed_playback(self, ctx, song):
+        """
+        Reacts to a stream that died part-way through.
+
+        The first failure is retried once from a fresh extraction, which recovers
+        the common case: an expired or IP-rejected stream URL. A second failure is
+        reported in chat and the song is dropped, so a bad track can't wedge the
+        queue. Either way the listener is told what happened instead of the song
+        vanishing silently.
+        """
+        guild_id = ctx.guild.id
+        log.warning("Stream for %r failed in guild %s (retried=%s)",
+                    song.title, guild_id, song.playback_retried)
+
+        if not song.playback_retried:
+            song.playback_retried = True
+            # The stream URL is what failed, so force a fresh extraction.
+            song.stream_url = None
+            song.fetched_at = 0.0
+            self.queues.setdefault(guild_id, []).insert(0, song)
+            await self._announce(ctx, embed=discord.Embed(
+                description=f"⚠️ The stream for **{song.title}** dropped out. Retrying…",
+                color=discord.Color.orange()))
+        else:
+            await self._announce(ctx, embed=discord.Embed(
+                title="❌ Playback Error",
+                description=f"**{song.title}** keeps failing to stream — the source may be "
+                            "blocked or rate-limiting us. Skipping it.",
+                color=discord.Color.red()))
+
+        await self.save_queue_to_db(guild_id)
+        if ctx.guild.voice_client:
+            await self.play_next(ctx)
+
+    async def on_song_end(self, ctx, finished_song_data, *, failed=False):
         """
         Callback function that is executed automatically after a song finishes playing.
         This handles looping logic and triggers the next song in the queue.
+
+        ``failed`` marks a song whose stream broke rather than finished. Such a
+        song never reaches the history or the loop queue — it didn't really play.
         """
         guild_id = ctx.guild.id
         loop_state = self.loop_states.get(guild_id, 'off')
+
+        if failed and finished_song_data is not None:
+            return await self._handle_failed_playback(ctx, finished_song_data)
+
+        # A clean play earns the song a fresh retry budget if it comes round again.
+        if finished_song_data is not None:
+            finished_song_data.playback_retried = False
 
         # Add the finished song to the history deque for the 'previous' command.
         if finished_song_data:
@@ -793,15 +918,19 @@ class Music(commands.Cog):
             # YouTube stream URLs expire and then FFmpeg fails with a 403.
             stream_fresh = self._song_has_fresh_stream(next_song)
 
+            audio_filter = self._filtergraph(guild_id)
+
             player = None
             try:
                 if stream_fresh:
-                    player = await YTDLSource.from_data(next_song.data, volume=volume)
+                    player = await YTDLSource.from_data(next_song.data, volume=volume,
+                                                        audio_filter=audio_filter)
                 else:
                     # Re-fetch a fresh stream URL from the page URL.
                     player = await YTDLSource.from_url(
                         next_song.url, loop=self.bot.loop, stream=True,
-                        requester=next_song.requester, volume=volume
+                        requester=next_song.requester, volume=volume,
+                        audio_filter=audio_filter
                     )
             except Exception:
                 log.exception("Failed to create player for %r", next_song.title)
@@ -810,7 +939,8 @@ class Music(commands.Cog):
                     try:
                         player = await YTDLSource.from_url(
                             next_song.url, loop=self.bot.loop, stream=True,
-                            requester=next_song.requester, volume=volume
+                            requester=next_song.requester, volume=volume,
+                            audio_filter=audio_filter
                         )
                     except Exception:
                         log.exception("Retry with fresh extraction also failed for %r", next_song.title)
@@ -823,7 +953,7 @@ class Music(commands.Cog):
                 return await self.on_song_end(ctx, None)
 
             try:
-                vc.play(player, after=self._make_after(ctx, next_song))
+                vc.play(player, after=self._make_after(ctx, next_song, player))
             except discord.ClientException:
                 # This can happen if the bot disconnects while trying to play.
                 return
@@ -1059,6 +1189,113 @@ class Music(commands.Cog):
             description=f"↕️ Moved **{song.title}** from **#{position}** to **#{destination}**.",
             color=discord.Color.green()))
 
+    @commands.hybrid_command(name='lyrics')
+    async def lyrics(self, ctx, *, query: str = None):
+        """Shows lyrics for the current song, or for a title you name."""
+        song = self.current_song.get(ctx.guild.id)
+        title = query or (song.title if song else None)
+        if not title:
+            return await ctx.send(embed=discord.Embed(
+                description="❌ Nothing is playing. Try `!lyrics <song title>`.",
+                color=discord.Color.red()))
+
+        # The LRCLIB round trip can exceed the slash 3s window.
+        await ctx.defer()
+        # Only match on duration for the song we're actually playing; a title the
+        # user typed could be any recording of it.
+        duration = song.duration if (song and not query) else None
+        result = await fetch_lyrics(title, duration)
+
+        if not result:
+            return await ctx.send(embed=discord.Embed(
+                description=f"❌ No lyrics found for **{title}**.", color=discord.Color.red()))
+
+        body = result.get("plain") or strip_timestamps(result.get("synced") or "")
+        if not body.strip():
+            return await ctx.send(embed=discord.Embed(
+                description=f"❌ No lyrics found for **{title}**.", color=discord.Color.red()))
+
+        truncated = len(body) > self.LYRICS_EMBED_LIMIT
+        if truncated:
+            # Cut at a line break so the text doesn't stop mid-word.
+            body = body[:self.LYRICS_EMBED_LIMIT].rsplit("\n", 1)[0]
+
+        embed = discord.Embed(title=f"📜 {result.get('matched') or title}",
+                              description=body, color=discord.Color.blurple())
+        footer = "Lyrics via LRCLIB"
+        if truncated:
+            footer += " · trimmed to fit Discord's limit"
+        if result.get("synced"):
+            player_url = self._player_url(ctx.guild.id)
+            if player_url:
+                footer += " · the live player scrolls these in time"
+        embed.set_footer(text=footer)
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name='jump', aliases=['skipto'])
+    async def jump(self, ctx, position: int):
+        """Skips straight to a queue position, dropping everything before it."""
+        guild_id = ctx.guild.id
+        vc = ctx.voice_client
+        if not vc or not vc.is_connected() or not (vc.is_playing() or vc.is_paused()):
+            return await ctx.send(embed=discord.Embed(
+                description="❌ I'm not playing anything to jump from.", color=discord.Color.red()))
+
+        queue = self.queues.get(guild_id)
+        if not queue:
+            return await ctx.send(embed=discord.Embed(
+                description="❌ The queue is empty — there's nowhere to jump to.",
+                color=discord.Color.red()))
+        if not 1 <= position <= len(queue):
+            return await ctx.send(embed=discord.Embed(
+                description=f"❌ Invalid position. Pick a number between 1 and {len(queue)}.",
+                color=discord.Color.red()))
+        if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
+            return await ctx.send(embed=discord.Embed(
+                description="❌ You must be in my voice channel to jump.", color=discord.Color.red()))
+
+        target = queue[position - 1]
+        # Jumping discards the songs in front of the target as well as the one
+        # currently playing, so permission is judged over that whole set.
+        current = self.current_song.get(guild_id)
+        dropped = queue[:position - 1] + ([current] if current else [])
+        owns_all = all(song.requester_id == ctx.author.id for song in dropped)
+
+        if ctx.author.guild_permissions.administrator or owns_all:
+            return await self._apply_jump(ctx, position, target, len(dropped))
+
+        voters = self.skip_votes.setdefault(guild_id, set())
+        status, votes, required_votes = self._tally_vote(vc, voters, ctx.author.id)
+        if status == self.VOTE_ALREADY:
+            return await ctx.send(embed=discord.Embed(
+                description="ℹ️ You have already voted to skip this song.", color=discord.Color.yellow()))
+        if status == self.VOTE_PASSED:
+            self.skip_votes.pop(guild_id, None)
+            return await self._apply_jump(ctx, position, target, len(dropped),
+                                          prefix=f"🗳️ Vote passed! ({votes}/{required_votes}). ")
+        await ctx.send(embed=discord.Embed(
+            description=f"🗳️ Vote to jump added. **{votes}/{required_votes}** votes now.",
+            color=discord.Color.blue()))
+
+    async def _apply_jump(self, ctx, position: int, target, dropped: int, prefix: str = ""):
+        """Drops the queue in front of `position` and skips onto the target song."""
+        guild_id = ctx.guild.id
+        note = ""
+        # Single-song loop would put the current song straight back at the front,
+        # landing the jump on the song it was supposed to leave.
+        if self.loop_states.get(guild_id) == 'song':
+            self.loop_states.pop(guild_id, None)
+            note = "\nLooping this song was turned off so the jump could land."
+
+        del self.queues[guild_id][:position - 1]
+        await self.save_queue_to_db(guild_id)
+        await ctx.send(embed=discord.Embed(
+            description=f"{prefix}⏭️ Jumping to **[{target.title}]({target.url})**, "
+                        f"skipping **{dropped}** song(s).{note}",
+            color=discord.Color.green()))
+        # The after callback then starts whatever is now at the front of the queue.
+        ctx.voice_client.stop()
+
     @commands.hybrid_command(name='volume', aliases=['vol'])
     async def volume(self, ctx, volume: int = None):
         """Sets the player's volume (0-200), saved permanently for the server."""
@@ -1145,29 +1382,146 @@ class Music(commands.Cog):
         # Re-extracting the stream can exceed the slash 3s window.
         await ctx.defer()
 
-        try:
-            new_source = await YTDLSource.from_url(
-                seek_url, loop=self.bot.loop, stream=True,
-                requester=source.requester, volume=source.volume, seek=seconds)
-        except Exception:
-            log.exception("Seek failed to build source")
-            return await ctx.send(embed=discord.Embed(description="❌ Could not seek — the stream may have expired.", color=discord.Color.red()))
+        if not await self._restart_at(ctx, seconds, seek_url=seek_url):
+            return await ctx.send(embed=discord.Embed(
+                description="❌ Could not seek — the stream may have expired.",
+                color=discord.Color.red()))
 
-        # Suppress the queue-advance that vc.stop() would otherwise trigger.
-        self.seek_in_progress.add(ctx.guild.id)
-        vc.stop()
-        try:
-            vc.play(new_source, after=self._make_after(ctx, song))
-        except discord.ClientException:
-            self.seek_in_progress.discard(ctx.guild.id)
-            return await ctx.send(embed=discord.Embed(description="❌ Could not resume after seeking.", color=discord.Color.red()))
-
-        self.current_song[ctx.guild.id] = song
-        # Back-date the start time so the nowplaying progress bar stays accurate.
-        self.song_start_times[ctx.guild.id] = time.time() - seconds
         await ctx.send(embed=discord.Embed(
             description=f"⏩ Seeked to **{time.strftime('%M:%S', time.gmtime(seconds))}**.",
             color=discord.Color.green()))
+
+    def _filtergraph(self, guild_id: int) -> Union[str, None]:
+        """The FFmpeg filtergraph for a guild's selected effect, if any."""
+        return self.AUDIO_FILTERS.get(self.guild_filters.get(guild_id, 'none'))
+
+    @staticmethod
+    async def _filtergraph_is_valid(graph: str) -> bool:
+        """
+        Checks a filtergraph by running it over a tenth of a second of silence.
+
+        A graph this FFmpeg build can't parse makes every stream fail the instant
+        it starts, which would otherwise chew through the whole queue one failed
+        retry at a time. This runs only when someone changes the filter, so the
+        extra process is cheap insurance. If FFmpeg isn't on PATH there's nothing
+        to check against, so the graph is allowed through.
+        """
+        try:
+            process = await asyncio.create_subprocess_exec(
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+                '-af', graph, '-t', '0.1', '-f', 'null', '-',
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        except (FileNotFoundError, NotImplementedError):
+            log.debug("Can't validate filtergraphs: no usable ffmpeg")
+            return True
+
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            log.error("FFmpeg rejected filtergraph %r: %s", graph,
+                      stderr.decode(errors='replace').strip())
+            return False
+        return True
+
+    async def _restart_at(self, ctx, seconds: int, *, seek_url: str = None) -> bool:
+        """
+        Rebuilds the current song's stream at ``seconds`` and resumes from there.
+
+        Shared by seek and the filter command: both have to re-extract the source,
+        because FFmpeg's start offset and filtergraph are fixed when the process
+        is launched. Returns False if the stream couldn't be rebuilt, leaving the
+        existing playback untouched.
+        """
+        guild_id = ctx.guild.id
+        vc = ctx.voice_client
+        source = vc.source
+        song = self.current_song.get(guild_id)
+        url = seek_url or (song.url if song else getattr(source, 'url', None))
+        if not url:
+            return False
+
+        try:
+            new_source = await YTDLSource.from_url(
+                url, loop=self.bot.loop, stream=True, requester=source.requester,
+                volume=source.volume, seek=seconds,
+                audio_filter=self._filtergraph(guild_id))
+        except Exception:
+            log.exception("Could not rebuild the stream for guild %s", guild_id)
+            return False
+
+        # Suppress the queue-advance that vc.stop() would otherwise trigger.
+        self.seek_in_progress.add(guild_id)
+        vc.stop()
+        try:
+            vc.play(new_source, after=self._make_after(ctx, song, new_source))
+        except discord.ClientException:
+            self.seek_in_progress.discard(guild_id)
+            return False
+
+        self.current_song[guild_id] = song
+        # Back-date the start time so the nowplaying progress bar stays accurate.
+        self.song_start_times[guild_id] = time.time() - seconds
+        return True
+
+    @commands.hybrid_command(name='filter', aliases=['fx'])
+    async def audio_effect(self, ctx, name: str = None):
+        """Applies an audio effect to playback (`!filter` on its own lists them)."""
+        guild_id = ctx.guild.id
+        current = self.guild_filters.get(guild_id, 'none')
+
+        if name is None:
+            embed = discord.Embed(
+                title="🎛️ Audio filters",
+                description="\n".join(
+                    f"{'**▸** ' if key == current else '• '}`{key}`"
+                    for key in self.AUDIO_FILTERS),
+                color=discord.Color.blue())
+            embed.set_footer(text="Filters reset to none when the bot restarts.")
+            return await ctx.send(embed=embed)
+
+        name = name.lower().strip()
+        if name not in self.AUDIO_FILTERS:
+            return await ctx.send(embed=discord.Embed(
+                description=f"❌ Unknown filter. Pick one of: "
+                            f"{', '.join(f'`{k}`' for k in self.AUDIO_FILTERS)}.",
+                color=discord.Color.red()))
+
+        vc = ctx.voice_client
+        if not vc or not vc.is_connected():
+            return await ctx.send(embed=discord.Embed(
+                description="❌ I am not in a voice channel.", color=discord.Color.red()))
+        if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
+            return await ctx.send(embed=discord.Embed(
+                description="❌ You must be in my voice channel to change the filter.",
+                color=discord.Color.red()))
+
+        graph = self.AUDIO_FILTERS[name]
+        if graph and not await self._filtergraph_is_valid(graph):
+            return await ctx.send(embed=discord.Embed(
+                description=f"❌ This FFmpeg build can't apply `{name}`, so it wasn't "
+                            "enabled — playback is unchanged.",
+                color=discord.Color.red()))
+
+        self.guild_filters[guild_id] = name
+        label = "turned off" if name == 'none' else f"set to **{name}**"
+
+        # Nothing playing: the setting still applies to whatever starts next.
+        if not (vc.is_playing() or vc.is_paused()):
+            return await ctx.send(embed=discord.Embed(
+                description=f"🎛️ Filter {label} — it applies from the next song.",
+                color=discord.Color.green()))
+
+        # Re-extracting the stream can exceed the slash 3s window.
+        await ctx.defer()
+        elapsed = int(time.time() - self.song_start_times.get(guild_id, time.time()))
+        if not await self._restart_at(ctx, max(elapsed, 0)):
+            return await ctx.send(embed=discord.Embed(
+                description=f"⚠️ Filter {label}, but the current song couldn't be "
+                            "restarted — it will apply from the next song.",
+                color=discord.Color.orange()))
+
+        await ctx.send(embed=discord.Embed(
+            description=f"🎛️ Filter {label}.", color=discord.Color.green()))
 
     @commands.hybrid_command(name='autoplay', aliases=['radio'])
     async def autoplay(self, ctx):

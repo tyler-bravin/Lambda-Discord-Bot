@@ -274,6 +274,9 @@ class Song:
         self.search_query = data.get('search_query')
         # When the stream URL was fetched; stream URLs expire after a few hours.
         self.fetched_at = time.time() if self.stream_url else 0.0
+        # Set once a broken stream for this song has been retried, so a source that
+        # keeps failing is dropped instead of looping forever (see Music.on_song_end).
+        self.playback_retried = False
 
     @classmethod
     def from_search(cls, title: str, artist: str, requester, *,

@@ -24,6 +24,10 @@ services:
       # Playback controls on the now-playing screen (require Discord login + in-channel).
       - WEB_CONTROLS=${WEB_CONTROLS:-0}
       - WEB_BASE_URL=${WEB_BASE_URL:-}
+      # Dated tar.gz snapshots of /data (set BACKUP_ENABLED=0 to turn off).
+      - BACKUP_ENABLED=${BACKUP_ENABLED:-1}
+      - BACKUP_INTERVAL_HOURS=${BACKUP_INTERVAL_HOURS:-24}
+      - BACKUP_KEEP=${BACKUP_KEEP:-7}
     volumes:
       # Persists music_queue.db, tasks.json and cookies.txt across redeploys.
       - lambda-data:/data
@@ -35,6 +39,8 @@ services:
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
     restart: unless-stopped
+    # Give it a moment to shut down cleanly instead of being killed at once.
+    stop_grace_period: 10s
 
 volumes:
   lambda-data:
