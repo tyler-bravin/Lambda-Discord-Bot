@@ -41,14 +41,27 @@ REQUEST_TIMEOUT_SECONDS = 20
 # officially released cut of a song is what someone asking for it by name means,
 # and a recording session is the rawest, least listenable version.
 CATEGORIES = ("released", "unreleased", "recording_session", "unsurfaced")
-PLAYABLE_CATEGORIES = ("released", "unreleased", "recording_session")
+# Only these two have audio behind them. The catalogue documents its 523 recording
+# sessions and 401 unsurfaced songs in detail — stem counts, engineers, studios —
+# but serves no file for any of them, so asking for a random one can only fail.
+NO_AUDIO_CATEGORIES = ("recording_session", "unsurfaced")
+PLAYABLE_CATEGORIES = ("released", "unreleased")
 RANDOM_DEFAULT_CATEGORY = "unreleased"
 
 # The API caps page_size at 100.
 MAX_PAGE_SIZE = 100
 SEARCH_RESULTS = 25
-# A random pick can land on an entry with no file; try again rather than give up.
-RANDOM_ATTEMPTS = 5
+# A random pick can land on an entry with no file; sample more rather than give up.
+SHUFFLE_DEFAULT = 20
+SHUFFLE_MAX = 50
+# Request budget for one shuffle. Tied to the size of the ask so a small one stays
+# cheap, with slack for the no-file entries that `any` includes, and a hard ceiling
+# so no single command can hammer the API.
+SAMPLE_BUDGET_PER_TRACK = 3
+SAMPLE_BUDGET_SLACK = 10
+MAX_SAMPLE_REQUESTS = 120
+# Sampling is one request per track, so they run in waves rather than one by one.
+SAMPLE_CONCURRENCY = 8
 
 
 def api_base() -> str:
@@ -185,28 +198,41 @@ def rank_matches(entries, query: str) -> list:
 
 # --- HTTP ---
 
-async def _get(path: str, params: dict = None) -> Optional[dict]:
+def _open_session() -> aiohttp.ClientSession:
+    """A session configured for the API, to be used as an async context manager."""
+    return aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT},
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS))
+
+
+async def _get_json(session, path: str, params: dict = None) -> Optional[dict]:
     """
-    GETs a JSON endpoint, or returns None.
+    One GET against an already-open session, or None.
 
     Never raises: a catalogue lookup that fails is reported to the listener as
     "nothing found", which is also what a network error amounts to for them.
     """
-    url = _endpoint(path)
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
     try:
-        async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT},
-                                         timeout=timeout) as session:
-            async with session.get(url, params=params or {}) as response:
-                if response.status != 200:
-                    log.debug("Juice WRLD API %s returned %s", path, response.status)
-                    return None
-                return await response.json()
+        async with session.get(_endpoint(path), params=params or {}) as response:
+            if response.status != 200:
+                log.debug("Juice WRLD API %s returned %s", path, response.status)
+                return None
+            return await response.json()
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
         log.debug("Juice WRLD API request to %s failed", path, exc_info=True)
         return None
     except Exception:
         log.exception("Unexpected failure calling the Juice WRLD API (%s)", path)
+        return None
+
+
+async def _get(path: str, params: dict = None) -> Optional[dict]:
+    """GETs a JSON endpoint on a session of its own, or returns None."""
+    try:
+        async with _open_session() as session:
+            return await _get_json(session, path, params)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        log.debug("Juice WRLD API request to %s failed", path, exc_info=True)
         return None
 
 
@@ -235,28 +261,74 @@ async def stats() -> Optional[dict]:
     return await _get("stats/")
 
 
-async def random_entry(category: str = RANDOM_DEFAULT_CATEGORY) -> Optional[dict]:
-    """
-    Picks a random playable entry, optionally within one category.
-
-    Rather than page through thousands of songs, this reads the result count and
-    jumps straight to a random single-song page.
-    """
+async def count_entries(category: str = None) -> int:
+    """How many entries a category holds, or 0 if the catalogue can't be reached."""
     params = {"page_size": 1}
     if category:
         params["category"] = category
-    first = await _get("songs/", params)
-    total = (first or {}).get("count") or 0
-    if not total:
-        return None
+    payload = await _get("songs/", params)
+    return (payload or {}).get("count") or 0
 
-    for _ in range(RANDOM_ATTEMPTS):
-        page = random.randint(1, total)
-        payload = await _get("songs/", {**params, "page": page})
-        results = (payload or {}).get("results") or []
-        if results and is_playable(results[0]):
-            return results[0]
-    return None
+
+async def random_entries(count: int, category: str = RANDOM_DEFAULT_CATEGORY) -> list:
+    """
+    Picks up to ``count`` distinct playable entries at random.
+
+    The API has no random ordering and no lightweight listing — a full page of 100
+    entries is about 700KB, because every entry carries its own lyrics — so pulling
+    the category down to shuffle it locally is out. Instead this reads the entry
+    count once and then fetches single-entry pages at random offsets, a wave at a
+    time. That is one small request per track and spreads the picks evenly over the
+    whole category, where sampling from one page would land them all in one era.
+
+    Offsets are drawn without replacement, so no two requests can return the same
+    track, and a wave that lands on entries with no audio file is topped up rather
+    than counted.
+    """
+    count = max(1, min(int(count), SHUFFLE_MAX))
+    total = await count_entries(category)
+    if not total:
+        return []
+
+    budget = min(total, MAX_SAMPLE_REQUESTS,
+                 count * SAMPLE_BUDGET_PER_TRACK + SAMPLE_BUDGET_SLACK)
+    offsets = random.sample(range(1, total + 1), budget)
+    params = {"page_size": 1}
+    if category:
+        params["category"] = category
+
+    def first_result(payload):
+        return ((payload or {}).get("results") or [None])[0]
+
+    picked, seen = [], set()
+    try:
+        async with _open_session() as session:
+            while offsets and len(picked) < count:
+                wave = [offsets.pop() for _ in range(min(count - len(picked), len(offsets)))]
+                for index in range(0, len(wave), SAMPLE_CONCURRENCY):
+                    chunk = wave[index:index + SAMPLE_CONCURRENCY]
+                    payloads = await asyncio.gather(*(
+                        _get_json(session, "songs/", {**params, "page": page})
+                        for page in chunk))
+                    for entry in map(first_result, payloads):
+                        # Distinct offsets mean distinct tracks unless the API's own
+                        # ordering shifts mid-shuffle, which the id check absorbs.
+                        if is_playable(entry) and entry["id"] not in seen:
+                            seen.add(entry["id"])
+                            picked.append(entry)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        log.debug("Sampling the Juice WRLD catalogue failed", exc_info=True)
+
+    # The offsets were drawn in random order, but shuffling keeps that true of the
+    # queue even if the wave logic ever changes.
+    random.shuffle(picked)
+    return picked[:count]
+
+
+async def random_entry(category: str = RANDOM_DEFAULT_CATEGORY) -> Optional[dict]:
+    """Picks a single random playable entry, optionally within one category."""
+    entries = await random_entries(1, category)
+    return entries[0] if entries else None
 
 
 # --- Link handling ---
