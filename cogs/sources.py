@@ -12,6 +12,7 @@ Supported inputs:
 - SoundCloud tracks and sets (native streaming).
 - Spotify tracks, albums, and playlists (metadata -> YouTube search).
 - Apple Music songs and albums (metadata -> YouTube search).
+- Juice WRLD API links (direct MP3 streaming, see cogs/juicewrld_api.py).
 
 Spotify and Apple Music are DRM-protected, so their audio can never be streamed
 directly. For those we read the track metadata and play the matching YouTube
@@ -257,12 +258,23 @@ class Song:
         # Fresh yt-dlp results carry 'webpage_url' (the page) and 'url' (the direct,
         # expiring stream URL). Dicts restored from the database only have 'url',
         # which is the *page* URL (see to_dict), so it must not be treated as a stream.
+        # Some sources (the Juice WRLD API) serve plain files on permanent URLs.
+        # Those need no refresh and no yt-dlp, so they are exempt from the expiry
+        # rules below and from the queue's re-resolution step.
+        self.permanent_stream = bool(data.get('permanent_stream'))
         if 'webpage_url' in data:
             self.url = data.get('webpage_url')
             self.stream_url = data.get('url')
         else:
             self.url = data.get('url')
-            self.stream_url = None
+            # A permanent stream is stored with the song (see to_dict), so it comes
+            # back from the database playable; anything else must be re-resolved.
+            self.stream_url = data.get('stream_url') if self.permanent_stream else None
+            if self.stream_url:
+                # YTDLSource.from_data plays data['url'], so a restored song needs
+                # its data pointing at the stream rather than at the page URL.
+                self.data = {**data, 'url': self.stream_url,
+                             'webpage_url': self.url, 'requester': requester}
         self.title = data.get('title', 'Unknown Title')
         self.thumbnail = data.get('thumbnail')
         self.duration = data.get('duration')
@@ -362,7 +374,7 @@ class Song:
         Only non-expiring metadata is saved; the full 'data' blob and the
         temporary 'stream_url' are excluded.
         """
-        return {
+        stored = {
             'url': self.url,
             'title': self.title,
             'thumbnail': self.thumbnail,
@@ -372,6 +384,12 @@ class Song:
             # Persisted so unresolved placeholders survive restarts.
             'search_query': self.search_query
         }
+        if self.permanent_stream and self.stream_url:
+            # This one doesn't expire, so keeping it means the song comes back
+            # after a restart ready to play with no lookup at all.
+            stored['permanent_stream'] = True
+            stored['stream_url'] = self.stream_url
+        return stored
 
 
 # --- Resolution result ---
@@ -404,8 +422,14 @@ def _netloc(query: str) -> str:
 
 
 def identify(query: str) -> str:
-    """Classifies a query into a source name: spotify, apple, soundcloud, youtube or search."""
+    """Classifies a query into a source name: spotify, apple, soundcloud, youtube,
+    juicewrld or search."""
     netloc = _netloc(query)
+    # Imported here rather than at module scope: the Juice WRLD client builds Songs,
+    # so it imports this module.
+    from cogs import juicewrld_api
+    if juicewrld_api.is_api_url(query):
+        return "juicewrld"
     if "spotify.com" in netloc:
         return "spotify"
     if "music.apple.com" in netloc:
@@ -573,6 +597,9 @@ async def resolve_query(query: str, requester, *, spotify=None, loop=None) -> Re
     loop = loop or asyncio.get_running_loop()
     source = identify(query)
 
+    if source == "juicewrld":
+        from cogs import juicewrld_api
+        return await juicewrld_api.resolve_link(query, requester)
     if source == "spotify":
         return await resolve_spotify(query, requester, spotify, loop)
     if source == "apple":
