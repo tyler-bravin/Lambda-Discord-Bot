@@ -3,10 +3,13 @@
 Commands for the Juice WRLD API catalogue.
 
 The catalogue holds far more than streaming services do — around 1,500 leaked
-unreleased tracks and 500 recording sessions alongside the official releases —
-and none of it is searchable by name through yt-dlp, which is the point of these
-commands. ``!play`` already handles a pasted juicewrldapi.com link; this cog is
-how you find something without one.
+unreleased tracks alongside the official releases — and none of it is searchable
+by name through yt-dlp, which is the point of these commands. ``!play`` already
+handles a pasted juicewrldapi.com link; this cog is how you find something
+without one, by name, at random, or by the queueful.
+
+The other 900-odd entries are documented without audio (see NO_AUDIO_CATEGORIES),
+so the category arguments only accept the two that can actually be played.
 
 Queueing goes through the Music cog, so Juice WRLD tracks sit in the same queue
 as everything else and work with skip, seek, loop, filters and the saved
@@ -30,6 +33,9 @@ class JuiceWRLD(commands.Cog):
     # results !juicesearch lists.
     ALTERNATIVES_SHOWN = 4
     SEARCH_RESULTS_SHOWN = 10
+    # Tracks named in the shuffle confirmation, so the embed stays readable when
+    # fifty of them were just queued.
+    SHUFFLE_PREVIEW = 5
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -98,6 +104,58 @@ class JuiceWRLD(commands.Cog):
             return self._error("You are not in a voice channel.")
         return None
 
+    @staticmethod
+    def _clean_category(category: str):
+        """
+        Normalises a category argument.
+
+        Returns ``(category, None)`` on success, where the category is None for
+        "any", or ``(None, error_embed)``. The no-audio categories are turned away
+        with the reason rather than left to fail as an empty result.
+        """
+        name = (category or "").strip().lower().replace(" ", "_")
+        if name in ("any", "all"):
+            return None, None
+        choices = ", ".join(f"`{known}`" for known in api.PLAYABLE_CATEGORIES)
+        if name in api.NO_AUDIO_CATEGORIES:
+            return None, JuiceWRLD._error(
+                f"The catalogue documents its **{name.replace('_', ' ')}** entries but "
+                f"has no audio for them. Try {choices} or `any`.")
+        if name not in api.PLAYABLE_CATEGORIES:
+            return None, JuiceWRLD._error(f"Pick one of {choices} or `any`.")
+        return name, None
+
+    async def _queue_many(self, ctx, entries: list, title: str) -> None:
+        """Adds a batch of catalogue entries to the queue and starts playback if idle."""
+        music = self._music
+        songs = [song for song in (api.build_song(entry, ctx.author) for entry in entries)
+                 if song is not None]
+        if not songs:
+            return await ctx.send(embed=self._error(
+                "Couldn't reach the Juice WRLD catalogue. Try again in a moment."))
+
+        vc = ctx.voice_client
+        was_playing = bool(vc and (vc.is_playing() or vc.is_paused()))
+        if not vc:
+            vc = await ctx.author.voice.channel.connect(self_deaf=True)
+            music.voice_clients[ctx.guild.id] = vc
+
+        music.queues.setdefault(ctx.guild.id, []).extend(songs)
+        await music.save_queue_to_db(ctx.guild.id)
+
+        preview = entries[:self.SHUFFLE_PREVIEW]
+        lines = [f"Queued **{len(songs)}** random tracks.", ""]
+        lines += [f"`{entry['id']}` {api.describe(entry)}" for entry in preview]
+        if len(songs) > len(preview):
+            lines.append(f"…and **{len(songs) - len(preview)}** more.")
+        embed = discord.Embed(title=title, description="\n".join(lines),
+                              color=discord.Color.from_rgb(153, 153, 153))
+        embed.set_footer(text="Juice WRLD API")
+        await ctx.send(embed=embed)
+
+        if not was_playing:
+            await music.play_next(ctx)
+
     # --- Commands ---
 
     @commands.hybrid_command(name='juice', aliases=['jw'])
@@ -108,7 +166,8 @@ class JuiceWRLD(commands.Cog):
             counts = (totals or {}).get("category_stats") or {}
             lines = [f"`{self.bot.command_prefix}juice <song name or id>` — queue a track",
                      f"`{self.bot.command_prefix}juicesearch <name>` — list matches",
-                     f"`{self.bot.command_prefix}juicerandom [category]` — queue a random one"]
+                     f"`{self.bot.command_prefix}juicerandom [category]` — queue a random one",
+                     f"`{self.bot.command_prefix}juiceshuffle [count]` — fill the queue at random"]
             if counts:
                 lines.append("\n" + " · ".join(
                     f"**{count}** {name.replace('_', ' ')}" for name, count in counts.items()))
@@ -175,13 +234,9 @@ class JuiceWRLD(commands.Cog):
         if blocked:
             return await ctx.send(embed=blocked)
 
-        category = (category or "").strip().lower().replace(" ", "_")
-        if category in ("any", "all"):
-            category = None
-        elif category not in api.PLAYABLE_CATEGORIES:
-            return await ctx.send(embed=self._error(
-                "Pick one of " + ", ".join(f"`{name}`" for name in api.PLAYABLE_CATEGORIES)
-                + " or `any`."))
+        category, invalid = self._clean_category(category)
+        if invalid:
+            return await ctx.send(embed=invalid)
 
         await ctx.defer()
         entry = await api.random_entry(category)
@@ -189,6 +244,33 @@ class JuiceWRLD(commands.Cog):
             return await ctx.send(embed=self._error(
                 "Couldn't reach the Juice WRLD catalogue. Try again in a moment."))
         await self._queue(ctx, entry, self._entry_embed(entry, "🧃 Random Pick"))
+
+    @commands.hybrid_command(name='juiceshuffle', aliases=['jwsh'])
+    async def juice_shuffle(self, ctx, count: int = api.SHUFFLE_DEFAULT,
+                            category: str = api.RANDOM_DEFAULT_CATEGORY):
+        """Fills the queue with random unreleased Juice WRLD tracks."""
+        blocked = self._requires_voice(ctx)
+        if blocked:
+            return await ctx.send(embed=blocked)
+
+        if count < 1:
+            return await ctx.send(embed=self._error("Ask for at least one track."))
+        if count > api.SHUFFLE_MAX:
+            return await ctx.send(embed=self._error(
+                f"{api.SHUFFLE_MAX} tracks at a time is the limit — that's one request "
+                "to the catalogue per track."))
+
+        category, invalid = self._clean_category(category)
+        if invalid:
+            return await ctx.send(embed=invalid)
+
+        # One request per track, so this comfortably outlasts an interaction token.
+        await ctx.defer()
+        entries = await api.random_entries(count, category)
+        if not entries:
+            return await ctx.send(embed=self._error(
+                "Couldn't reach the Juice WRLD catalogue. Try again in a moment."))
+        await self._queue_many(ctx, entries, "🧃 Shuffled the Catalogue")
 
 
 async def setup(bot: commands.Bot):
