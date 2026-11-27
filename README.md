@@ -164,6 +164,9 @@ Most commands work both as prefix commands (`!play`) **and** as slash commands (
 | `!stop` | | ✅ | Stops the music and clears the queue (requires votes). |
 | `!skip` | `!s` | ✅ | Skips the current song (requires votes). |
 | `!seek <MM:SS>` | | ✅ | Jumps to a position in the current song. |
+| `!jump <number>` | `!skipto` | ✅ | Skips straight to a queue position, dropping what's before it. |
+| `!filter [name]` | `!fx` | ✅ | Applies an audio effect (`bassboost`, `nightcore`, `slowed`, `vocals`, `8d`). |
+| `!lyrics [title]` | | ✅ | Lyrics for the current song, or for a title you name. |
 | `!queue` | `!q` | ✅ | Displays the current song queue. |
 | `!nowplaying` | `!np` | ✅ | Shows detailed info about the current song. |
 | `!volume <0-200>`| `!vol` | ✅ | Sets the music volume for the server. |
@@ -173,6 +176,17 @@ Most commands work both as prefix commands (`!play`) **and** as slash commands (
 | `!remove <number>`| `!rm` | ✅ | Removes a song from the queue by its number. |
 | `!clear` | | ✅ | Clears all songs from the queue (requires votes). |
 | `!disconnect` | `!dc` | ✅ | Disconnects the bot from the voice channel. |
+
+### Playlist Commands
+| Command | Aliases | Slash | Description |
+|---|---|---|---|
+| `!save <name>` | | ✅ | Saves the current song and queue as a named playlist. |
+| `!load <name>` | | ✅ | Adds a saved playlist to the end of the queue. |
+| `!playlists` | | ✅ | Lists the playlists saved on this server. |
+| `!delplaylist <name>` | `!deleteplaylist` | ✅ | Deletes a playlist (its owner or an admin). |
+
+Playlists are per-server, capped at 25 per server and 500 tracks each. Only track
+metadata is stored, so a loaded playlist re-resolves each stream at play time.
 
 ### TaskBoard Commands
 | Command | Slash | Description |
@@ -193,6 +207,8 @@ Most commands work both as prefix commands (`!play`) **and** as slash commands (
 | `!reload` | — | **(Bot Owner Only)** Reloads all cogs. |
 | `!ytdlp` | — | **(Bot Owner Only)** Forces an immediate yt-dlp update check. |
 | `!sync` | — | **(Bot Owner Only)** Re-syncs slash commands with Discord. |
+| `!backup` | — | **(Bot Owner Only)** Snapshots the data directory and uploads it to the channel. |
+| `!backups` | — | **(Bot Owner Only)** Lists the retained snapshots. |
 
 ### Supported sources
 | Source | What works | How |
