@@ -45,6 +45,7 @@ from cogs.sources import (
     resolve_query,
     upgrade_ytdlp_blocking,
 )
+from cogs.lyrics import fetch_lyrics, strip_timestamps
 from cogs.views import LoopControlsView, PlayerControls, QueuePaginator
 
 log = logging.getLogger(__name__)
@@ -205,6 +206,10 @@ class Music(commands.Cog):
     # are decoded at 48 kHz, which is what the resampling filters key off.
     # Deliberately not persisted: an effect is a "right now" choice, so a restart
     # putting playback back to normal is the safer default.
+    # Discord caps an embed description at 4096 characters; leave room for the
+    # title and footer rather than sitting exactly on the limit.
+    LYRICS_EMBED_LIMIT = 3900
+
     AUDIO_FILTERS = {
         'none': None,
         'bassboost': 'bass=g=12',
@@ -1183,6 +1188,49 @@ class Music(commands.Cog):
         await ctx.send(embed=discord.Embed(
             description=f"↕️ Moved **{song.title}** from **#{position}** to **#{destination}**.",
             color=discord.Color.green()))
+
+    @commands.hybrid_command(name='lyrics')
+    async def lyrics(self, ctx, *, query: str = None):
+        """Shows lyrics for the current song, or for a title you name."""
+        song = self.current_song.get(ctx.guild.id)
+        title = query or (song.title if song else None)
+        if not title:
+            return await ctx.send(embed=discord.Embed(
+                description="❌ Nothing is playing. Try `!lyrics <song title>`.",
+                color=discord.Color.red()))
+
+        # The LRCLIB round trip can exceed the slash 3s window.
+        await ctx.defer()
+        # Only match on duration for the song we're actually playing; a title the
+        # user typed could be any recording of it.
+        duration = song.duration if (song and not query) else None
+        result = await fetch_lyrics(title, duration)
+
+        if not result:
+            return await ctx.send(embed=discord.Embed(
+                description=f"❌ No lyrics found for **{title}**.", color=discord.Color.red()))
+
+        body = result.get("plain") or strip_timestamps(result.get("synced") or "")
+        if not body.strip():
+            return await ctx.send(embed=discord.Embed(
+                description=f"❌ No lyrics found for **{title}**.", color=discord.Color.red()))
+
+        truncated = len(body) > self.LYRICS_EMBED_LIMIT
+        if truncated:
+            # Cut at a line break so the text doesn't stop mid-word.
+            body = body[:self.LYRICS_EMBED_LIMIT].rsplit("\n", 1)[0]
+
+        embed = discord.Embed(title=f"📜 {result.get('matched') or title}",
+                              description=body, color=discord.Color.blurple())
+        footer = "Lyrics via LRCLIB"
+        if truncated:
+            footer += " · trimmed to fit Discord's limit"
+        if result.get("synced"):
+            player_url = self._player_url(ctx.guild.id)
+            if player_url:
+                footer += " · the live player scrolls these in time"
+        embed.set_footer(text=footer)
+        await ctx.send(embed=embed)
 
     @commands.hybrid_command(name='jump', aliases=['skipto'])
     async def jump(self, ctx, position: int):
