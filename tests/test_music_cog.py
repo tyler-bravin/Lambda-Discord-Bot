@@ -1255,3 +1255,82 @@ async def test_filtergraph_validation_rejects_a_nonzero_exit(music_cog):
     with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock,
                return_value=process):
         assert await music_cog._filtergraph_is_valid('nope') is False
+
+
+# --- Lyrics command ---
+
+@pytest.mark.asyncio
+async def test_lyrics_uses_the_current_song(music_cog, mock_ctx):
+    music_cog.current_song[mock_ctx.guild.id] = _song("Never Gonna Give You Up")
+
+    with patch('cogs.Music.fetch_lyrics', new_callable=AsyncMock,
+               return_value={"plain": "we're no strangers", "synced": None,
+                             "matched": "Rick Astley — Never Gonna Give You Up"}) as fetch:
+        await music_cog.lyrics.callback(music_cog, mock_ctx, query=None)
+
+    # The playing track's duration is used to reject the wrong recording.
+    assert fetch.await_args.args == ("Never Gonna Give You Up", 212)
+    embed = mock_ctx.send.await_args.kwargs['embed']
+    assert "Rick Astley" in embed.title
+
+
+@pytest.mark.asyncio
+async def test_lyrics_ignores_duration_for_a_typed_query(music_cog, mock_ctx):
+    """A title the user typed could be any recording, so don't filter by our length."""
+    music_cog.current_song[mock_ctx.guild.id] = _song("something else")
+
+    with patch('cogs.Music.fetch_lyrics', new_callable=AsyncMock,
+               return_value={"plain": "words", "synced": None, "matched": "X — Y"}) as fetch:
+        await music_cog.lyrics.callback(music_cog, mock_ctx, query="a different song")
+
+    assert fetch.await_args.args == ("a different song", None)
+
+
+@pytest.mark.asyncio
+async def test_lyrics_needs_something_to_look_up(music_cog, mock_ctx):
+    await music_cog.lyrics.callback(music_cog, mock_ctx, query=None)
+
+    assert "Nothing is playing" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_lyrics_reports_when_nothing_matched(music_cog, mock_ctx):
+    with patch('cogs.Music.fetch_lyrics', new_callable=AsyncMock, return_value=None):
+        await music_cog.lyrics.callback(music_cog, mock_ctx, query="obscure b-side")
+
+    assert "No lyrics found" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_lyrics_falls_back_to_the_synced_text(music_cog, mock_ctx):
+    """When only an LRC body exists, the timestamps are stripped for Discord."""
+    with patch('cogs.Music.fetch_lyrics', new_callable=AsyncMock,
+               return_value={"plain": None, "synced": "[00:01.00] first\n[00:05.00] second",
+                             "matched": "X — Y"}):
+        await music_cog.lyrics.callback(music_cog, mock_ctx, query="song")
+
+    description = mock_ctx.send.await_args.kwargs['embed'].description
+    assert description == "first\nsecond"
+
+
+@pytest.mark.asyncio
+async def test_lyrics_are_trimmed_to_the_embed_limit(music_cog, mock_ctx):
+    long_body = "\n".join(f"line {i}" for i in range(2000))
+    with patch('cogs.Music.fetch_lyrics', new_callable=AsyncMock,
+               return_value={"plain": long_body, "synced": None, "matched": "X — Y"}):
+        await music_cog.lyrics.callback(music_cog, mock_ctx, query="song")
+
+    embed = mock_ctx.send.await_args.kwargs['embed']
+    assert len(embed.description) <= Music.LYRICS_EMBED_LIMIT
+    # Cut at a line break, so the last line isn't half a word.
+    assert not embed.description.endswith("lin")
+    assert "trimmed" in embed.footer.text
+
+
+@pytest.mark.asyncio
+async def test_lyrics_treats_an_empty_body_as_no_match(music_cog, mock_ctx):
+    with patch('cogs.Music.fetch_lyrics', new_callable=AsyncMock,
+               return_value={"plain": "   ", "synced": None, "matched": "X — Y"}):
+        await music_cog.lyrics.callback(music_cog, mock_ctx, query="song")
+
+    assert "No lyrics found" in mock_ctx.send.await_args.kwargs['embed'].description
