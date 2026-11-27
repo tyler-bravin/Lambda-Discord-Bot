@@ -28,7 +28,6 @@ import html
 import json
 import logging
 import os
-import re
 import secrets
 import time
 from pathlib import Path
@@ -40,6 +39,7 @@ from aiohttp import web
 from discord.ext import commands
 
 from cogs.TaskBoard import Task
+from cogs.lyrics import fetch_lyrics
 
 # HTML/CSS lives in cogs/templates so this module stays Python.
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -48,10 +48,6 @@ TEMPLATE_DIR = Path(__file__).parent / "templates"
 def _load_template(name: str) -> str:
     return (TEMPLATE_DIR / name).read_text(encoding="utf-8")
 
-
-
-LRCLIB_SEARCH = "https://lrclib.net/api/search"
-LRCLIB_UA = "Lambda-Discord-Bot (https://github.com/tyler-bravin/Lambda-Discord-Bot)"
 
 log = logging.getLogger(__name__)
 
@@ -361,13 +357,6 @@ class WebServer(commands.Cog):
         ok = result.get("ok") or result.get("pending")
         return web.json_response(result, status=200 if ok else 400)
 
-    @staticmethod
-    def _clean_track_title(title: str) -> str:
-        """Strips common YouTube noise so lyrics lookups match better."""
-        cleaned = re.sub(r"\[[^\]]*\]", "", title or "")
-        cleaned = re.sub(r"\([^)]*\)", "", cleaned)
-        return cleaned.strip(" -")
-
     async def handle_np_lyrics(self, request: web.Request) -> web.Response:
         guild, music = self._np_context(request)
         if guild is None or music is None:
@@ -376,32 +365,8 @@ class WebServer(commands.Cog):
         if not song:
             return web.json_response({"synced": None, "plain": None})
 
-        query = self._clean_track_title(song.title)
-        try:
-            async with aiohttp.ClientSession(headers={"User-Agent": LRCLIB_UA}) as session:
-                async with session.get(LRCLIB_SEARCH, params={"q": query}) as resp:
-                    results = await resp.json() if resp.status == 200 else []
-        except Exception:
-            log.debug("LRCLIB lookup failed", exc_info=True)
-            results = []
-
-        # Prefer a result with lyrics and the closest duration to our track.
-        best, best_diff = None, None
-        for item in results:
-            if not (item.get("syncedLyrics") or item.get("plainLyrics")):
-                continue
-            diff = abs((item.get("duration") or 0) - (song.duration or 0))
-            if best is None or diff < best_diff:
-                best, best_diff = item, diff
-
-        # Reject wildly mismatched durations when we know ours.
-        if best and (not song.duration or best_diff <= 20):
-            return web.json_response({
-                "synced": best.get("syncedLyrics"),
-                "plain": best.get("plainLyrics"),
-                "matched": f"{best.get('artistName', '')} — {best.get('trackName', '')}".strip(" —"),
-            })
-        return web.json_response({"synced": None, "plain": None})
+        result = await fetch_lyrics(song.title, song.duration)
+        return web.json_response(result or {"synced": None, "plain": None})
 
     # --- Rendering ---
     async def handle_index(self, request: web.Request) -> web.Response:
