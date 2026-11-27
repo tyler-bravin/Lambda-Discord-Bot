@@ -1096,3 +1096,162 @@ async def test_jump_does_nothing_when_idle(music_cog, mock_ctx):
     await music_cog.jump.callback(music_cog, mock_ctx, position=1)
 
     assert "not playing anything" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+# --- Audio filters ---
+
+def test_filtergraph_defaults_to_none(music_cog):
+    assert music_cog._filtergraph(12345) is None
+
+
+def test_filtergraph_resolves_a_selected_effect(music_cog):
+    music_cog.guild_filters[12345] = 'bassboost'
+    assert music_cog._filtergraph(12345) == Music.AUDIO_FILTERS['bassboost']
+
+
+def test_ffmpeg_options_append_the_filtergraph():
+    options = YTDLSource._ffmpeg_options(audio_filter='bass=g=12')
+    # -af belongs after the input, not among the reconnect/seek arguments.
+    assert '-af' in options['options']
+    assert '-af' not in options['before_options']
+
+
+def test_ffmpeg_options_omit_af_without_a_filter():
+    assert '-af' not in YTDLSource._ffmpeg_options()['options']
+
+
+def test_ffmpeg_options_keep_seek_and_filter_separate():
+    options = YTDLSource._ffmpeg_options(seek=30, audio_filter='bass=g=12')
+    assert '-ss 30' in options['before_options']
+    assert '-af' in options['options']
+
+
+@pytest.mark.asyncio
+async def test_filter_without_a_name_lists_the_options(music_cog, mock_ctx):
+    await music_cog.audio_effect.callback(music_cog, mock_ctx, name=None)
+
+    embed = mock_ctx.send.await_args.kwargs['embed']
+    assert "bassboost" in embed.description
+    # The active choice is marked.
+    assert "**▸** `none`" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_filter_rejects_an_unknown_name(music_cog, mock_ctx):
+    await music_cog.audio_effect.callback(music_cog, mock_ctx, name="earrape")
+
+    assert 12345 not in music_cog.guild_filters
+    assert "Unknown filter" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_filter_restarts_the_current_song(music_cog, mock_ctx):
+    _playing_ctx(mock_ctx, music_cog, [], current=_song("playing"))
+    music_cog.song_start_times[mock_ctx.guild.id] = time.time() - 42
+
+    with patch.object(music_cog, '_filtergraph_is_valid', new_callable=AsyncMock,
+                      return_value=True),             patch.object(music_cog, '_restart_at', new_callable=AsyncMock,
+                         return_value=True) as restart:
+        await music_cog.audio_effect.callback(music_cog, mock_ctx, name="NightCore")
+
+    assert music_cog.guild_filters[mock_ctx.guild.id] == 'nightcore'
+    # Resumes from where the song had got to, not from the beginning.
+    assert restart.await_args.args[1] == pytest.approx(42, abs=2)
+
+
+@pytest.mark.asyncio
+async def test_filter_applies_to_the_next_song_when_idle(music_cog, mock_ctx):
+    vc = _playing_ctx(mock_ctx, music_cog, [])
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+
+    with patch.object(music_cog, '_filtergraph_is_valid', new_callable=AsyncMock,
+                      return_value=True):
+        await music_cog.audio_effect.callback(music_cog, mock_ctx, name="8d")
+
+    assert music_cog.guild_filters[mock_ctx.guild.id] == '8d'
+    assert "next song" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_filter_keeps_the_setting_if_the_restart_fails(music_cog, mock_ctx):
+    """A failed rebuild leaves playback alone but the choice still takes effect later."""
+    _playing_ctx(mock_ctx, music_cog, [], current=_song("playing"))
+    music_cog.song_start_times[mock_ctx.guild.id] = time.time()
+
+    with patch.object(music_cog, '_filtergraph_is_valid', new_callable=AsyncMock,
+                      return_value=True),             patch.object(music_cog, '_restart_at', new_callable=AsyncMock, return_value=False):
+        await music_cog.audio_effect.callback(music_cog, mock_ctx, name="slowed")
+
+    assert music_cog.guild_filters[mock_ctx.guild.id] == 'slowed'
+    assert "couldn't be restarted" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_filter_requires_sharing_the_voice_channel(music_cog, mock_ctx):
+    _playing_ctx(mock_ctx, music_cog, [], current=_song("playing"))
+    mock_ctx.author.voice.channel = MagicMock()
+
+    await music_cog.audio_effect.callback(music_cog, mock_ctx, name="bassboost")
+
+    assert 12345 not in music_cog.guild_filters
+
+
+@pytest.mark.asyncio
+async def test_play_next_applies_the_guild_filter(music_cog, mock_ctx, mock_player):
+    """The selected effect reaches the source that play_next builds."""
+    song = Song(full_song_data, MagicMock())
+    music_cog.queues[mock_ctx.guild.id] = [song]
+    music_cog.guild_filters[mock_ctx.guild.id] = 'bassboost'
+    mock_ctx.guild.voice_client.is_connected.return_value = True
+
+    with patch('cogs.Music.YTDLSource.from_data', new_callable=AsyncMock,
+               return_value=mock_player) as from_data:
+        await music_cog.play_next(mock_ctx)
+
+    assert from_data.await_args.kwargs['audio_filter'] == Music.AUDIO_FILTERS['bassboost']
+
+
+@pytest.mark.asyncio
+async def test_filter_is_refused_when_ffmpeg_rejects_the_graph(music_cog, mock_ctx):
+    """A graph this FFmpeg can't parse would fail every stream, so it isn't enabled."""
+    _playing_ctx(mock_ctx, music_cog, [], current=_song("playing"))
+
+    with patch.object(music_cog, '_filtergraph_is_valid', new_callable=AsyncMock,
+                      return_value=False),             patch.object(music_cog, '_restart_at', new_callable=AsyncMock) as restart:
+        await music_cog.audio_effect.callback(music_cog, mock_ctx, name="8d")
+
+    assert 12345 not in music_cog.guild_filters
+    restart.assert_not_awaited()
+    assert "can't apply" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_turning_the_filter_off_needs_no_validation(music_cog, mock_ctx):
+    """`none` has no graph, so it must not depend on an ffmpeg probe succeeding."""
+    _playing_ctx(mock_ctx, music_cog, [], current=_song("playing"))
+    music_cog.guild_filters[mock_ctx.guild.id] = 'nightcore'
+
+    with patch.object(music_cog, '_filtergraph_is_valid', new_callable=AsyncMock,
+                      return_value=False) as validate,             patch.object(music_cog, '_restart_at', new_callable=AsyncMock, return_value=True):
+        await music_cog.audio_effect.callback(music_cog, mock_ctx, name="none")
+
+    validate.assert_not_awaited()
+    assert music_cog.guild_filters[mock_ctx.guild.id] == 'none'
+
+
+@pytest.mark.asyncio
+async def test_filtergraph_validation_allows_graphs_without_ffmpeg(music_cog):
+    """With no ffmpeg to probe against there is nothing to reject on."""
+    with patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError):
+        assert await music_cog._filtergraph_is_valid('bass=g=12') is True
+
+
+@pytest.mark.asyncio
+async def test_filtergraph_validation_rejects_a_nonzero_exit(music_cog):
+    process = AsyncMock()
+    process.communicate = AsyncMock(return_value=(b"", b"No such filter: 'nope'"))
+    process.returncode = 1
+    with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock,
+               return_value=process):
+        assert await music_cog._filtergraph_is_valid('nope') is False
