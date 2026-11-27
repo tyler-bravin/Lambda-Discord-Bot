@@ -985,3 +985,114 @@ async def test_clean_play_restores_the_retry_budget(music_cog, mock_ctx):
     await music_cog.on_song_end(mock_ctx, song, failed=False)
 
     assert song.playback_retried is False
+
+
+# --- Jump ---
+
+def _playing_ctx(mock_ctx, music_cog, queue, *, current=None, admin=False):
+    """A context where the author shares the bot's voice channel and music is playing."""
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    vc.channel = MagicMock()
+    mock_ctx.voice_client = vc
+    mock_ctx.guild.voice_client = vc
+    mock_ctx.author.voice.channel = vc.channel
+    mock_ctx.author.guild_permissions.administrator = admin
+    mock_ctx.author.id = 777
+    music_cog.queues[mock_ctx.guild.id] = queue
+    if current is not None:
+        music_cog.current_song[mock_ctx.guild.id] = current
+    return vc
+
+
+def _song(title, requester_id=777):
+    song = Song({**full_song_data, 'title': title}, MagicMock())
+    song.requester_id = requester_id
+    return song
+
+
+@pytest.mark.asyncio
+async def test_jump_drops_the_songs_in_front_of_the_target(music_cog, mock_ctx):
+    queue = [_song("a"), _song("b"), _song("c")]
+    vc = _playing_ctx(mock_ctx, music_cog, queue, current=_song("playing"))
+
+    await music_cog.jump.callback(music_cog, mock_ctx, position=3)
+
+    assert [s.title for s in music_cog.queues[mock_ctx.guild.id]] == ["c"]
+    # Stopping the player makes the after callback start the new front of the queue.
+    vc.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_jump_rejects_a_position_outside_the_queue(music_cog, mock_ctx):
+    queue = [_song("a"), _song("b")]
+    vc = _playing_ctx(mock_ctx, music_cog, queue)
+
+    await music_cog.jump.callback(music_cog, mock_ctx, position=5)
+
+    assert len(music_cog.queues[mock_ctx.guild.id]) == 2
+    vc.stop.assert_not_called()
+    assert "between 1 and 2" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_jump_requires_sharing_the_voice_channel(music_cog, mock_ctx):
+    queue = [_song("a"), _song("b")]
+    vc = _playing_ctx(mock_ctx, music_cog, queue)
+    mock_ctx.author.voice.channel = MagicMock()  # a different channel
+
+    await music_cog.jump.callback(music_cog, mock_ctx, position=2)
+
+    assert len(music_cog.queues[mock_ctx.guild.id]) == 2
+    vc.stop.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_jump_needs_a_vote_from_someone_elses_queue(music_cog, mock_ctx):
+    """A non-admin dropping other people's songs has to win a skip vote."""
+    queue = [_song("a", requester_id=999), _song("b")]
+    vc = _playing_ctx(mock_ctx, music_cog, queue, current=_song("playing", requester_id=999))
+    vc.channel.members = [MagicMock(bot=False) for _ in range(6)]
+
+    await music_cog.jump.callback(music_cog, mock_ctx, position=2)
+
+    assert len(music_cog.queues[mock_ctx.guild.id]) == 2  # nothing dropped yet
+    vc.stop.assert_not_called()
+    assert "Vote to jump" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_jump_is_immediate_for_an_admin(music_cog, mock_ctx):
+    queue = [_song("a", requester_id=999), _song("b", requester_id=999)]
+    vc = _playing_ctx(mock_ctx, music_cog, queue,
+                      current=_song("playing", requester_id=999), admin=True)
+
+    await music_cog.jump.callback(music_cog, mock_ctx, position=2)
+
+    assert [s.title for s in music_cog.queues[mock_ctx.guild.id]] == ["b"]
+    vc.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_jump_turns_off_single_song_loop(music_cog, mock_ctx):
+    """Otherwise the looped song is requeued at the front and the jump misses."""
+    gid = mock_ctx.guild.id
+    queue = [_song("a"), _song("b")]
+    _playing_ctx(mock_ctx, music_cog, queue, current=_song("playing"))
+    music_cog.loop_states[gid] = 'song'
+
+    await music_cog.jump.callback(music_cog, mock_ctx, position=2)
+
+    assert gid not in music_cog.loop_states
+    assert "turned off" in mock_ctx.send.await_args.kwargs['embed'].description
+
+
+@pytest.mark.asyncio
+async def test_jump_does_nothing_when_idle(music_cog, mock_ctx):
+    mock_ctx.voice_client = None
+
+    await music_cog.jump.callback(music_cog, mock_ctx, position=1)
+
+    assert "not playing anything" in mock_ctx.send.await_args.kwargs['embed'].description
